@@ -1,0 +1,110 @@
+# Backing services for ReadShelf local development.
+# Versions track the README tech stack; Elasticsearch is pinned to 9.x to match
+# the Elasticsearch client (9.2.x) managed by Spring Boot 4.0.
+#
+#   docker compose up -d
+#
+# Credentials default to dev values and can be overridden via a .env file
+# (see .env.example).
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: readshelf-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-readshelf}
+      POSTGRES_USER: ${DB_USERNAME:-readshelf}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-readshelf}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-readshelf} -d ${DB_NAME:-readshelf}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: readshelf-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: readshelf-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-readshelf}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-readshelf}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"     # AMQP
+      - "${RABBITMQ_UI_PORT:-15672}:15672" # Management UI
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.2.0
+    container_name: readshelf-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: readshelf-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-readshelf}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-readshelf-secret}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"        # S3 API
+      - "${MINIO_CONSOLE_PORT:-9001}:9001" # Web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: readshelf-mailhog
+    ports:
+      - "${MAIL_PORT:-1025}:1025"   # SMTP
+      - "${MAIL_UI_PORT:-8025}:8025" # Web UI
+
+volumes:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:
+  elasticsearch-data:
+  minio-data:

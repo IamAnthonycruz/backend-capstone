@@ -1,0 +1,113 @@
+# Base configuration shared by all profiles.
+# Every value is overridable via environment variables (12-factor config).
+# Profile-specific overrides live in application-dev.yml / application-prod.yml.
+
+spring:
+  application:
+    name: read-shelf
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+
+  # --- Relational database (PostgreSQL) ---
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/readshelf}
+    username: ${DB_USERNAME:readshelf}
+    password: ${DB_PASSWORD:readshelf}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:10}
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+      connection-timeout: ${DB_POOL_CONNECTION_TIMEOUT:30000}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema; JPA never generates DDL.
+      ddl-auto: none
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  # --- Migrations (Flyway) ---
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  # --- Cache / Redis ---
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+  cache:
+    type: redis
+
+  # --- Messaging (RabbitMQ) ---
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:readshelf}
+    password: ${RABBITMQ_PASSWORD:readshelf}
+
+  # --- Search (Elasticsearch) ---
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://localhost:9200}
+    username: ${ELASTICSEARCH_USERNAME:}
+    password: ${ELASTICSEARCH_PASSWORD:}
+
+  # --- Email (JavaMailSender; MailHog in dev) ---
+  mail:
+    host: ${MAIL_HOST:localhost}
+    port: ${MAIL_PORT:1025}
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_PASSWORD:}
+
+  # Let Spring start even when an optional backing service is briefly unavailable.
+  # spring-boot-docker-compose auto-starts the compose file during local dev runs.
+  docker:
+    compose:
+      enabled: ${DOCKER_COMPOSE_ENABLED:true}
+      file: docker-compose.yml
+      lifecycle-management: start-only
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+# --- Object storage (MinIO) ---
+# No Spring auto-configuration exists for MinIO; these keys are bound by a
+# @ConfigurationProperties class added in the object-storage phase.
+readshelf:
+  minio:
+    endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
+    access-key: ${MINIO_ACCESS_KEY:readshelf}
+    secret-key: ${MINIO_SECRET_KEY:readshelf-secret}
+    bucket: ${MINIO_BUCKET:book-covers}
+  security:
+    jwt:
+      secret: ${JWT_SECRET:change-me-in-prod-this-must-be-at-least-256-bits-long}
+      access-token-ttl: ${JWT_ACCESS_TTL:PT15M}
+      refresh-token-ttl: ${JWT_REFRESH_TTL:P7D}
+
+# --- Observability (Actuator + Prometheus) ---
+management:
+  endpoints:
+    web:
+      exposure:
+        include: ${ACTUATOR_EXPOSE:health,info,metrics,prometheus}
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+# --- API documentation (SpringDoc / Swagger UI) ---
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui

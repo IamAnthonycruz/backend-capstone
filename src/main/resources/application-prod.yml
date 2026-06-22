@@ -1,0 +1,21 @@
+# Production profile. All secrets and connection details must come from the
+# environment; there are no localhost fallbacks here on purpose.
+spring:
+  jpa:
+    show-sql: false
+  # Never auto-start containers in production.
+  docker:
+    compose:
+      enabled: false
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+logging:
+  level:
+    root: INFO
+    com.readshelf: INFO
+
+management:
+  endpoint:
+    health:
+      show-details: when-authorized
