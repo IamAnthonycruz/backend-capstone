@@ -1,6 +1,6 @@
 # ReadShelf — Status
 
-_Last updated: 2026-06-09_
+_Last updated: 2026-06-19_
 
 ## Where we are
 
@@ -10,6 +10,11 @@ MailHog), `dev`/`prod` profiles, `GET /api/v1/health`.
 
 **Phase 2 (Data Model & CRUD): COMPLETE.** All CRUD slices built + verified
 (full relationship chain round-trips through the API; FK resolution + fail-fast 400s work).
+
+**Phase 3 (RESTful Design & Serialization): COMPLETE.** Offset pagination + sorting +
+param validation (all 6 list endpoints), 409-on-conflict, keyset/cursor pagination (loans),
+nested route (`/books/{id}/reviews`), ETags + 304, HATEOAS `_links` (loan), v2 book detail
+(URI versioning + JPQL aggregate). All verified live. See Phase 3 progress below.
 
 ## Phase 2 progress
 
@@ -105,8 +110,20 @@ MailHog), `dev`/`prod` profiles, `GET /api/v1/health`.
       links (e.g. `approve` only when REQUESTED) deferred to Phase 7 — HashMap chosen now
       so they can be added conditionally without a rewrite.
 
+- [x] **v2 book detail shape (URI versioning)** — `GET /api/v2/books/{id}` returns a
+      richer `BookDetailV2DTO` = v1 fields + `averageRating` (nullable Double) + `reviewCount`.
+      URI versioning (chosen over media-type/query-param, consistent with `/v1`) in a separate
+      `BookV2Controller` (`/api/v2/books`). The aggregate is built straight into the DTO by a
+      JPQL **constructor expression** (`SELECT new ...BookDetailV2DTO(...)`) over the mapped
+      `Book LEFT JOIN b.reviews` with `GROUP BY` on all six non-aggregate fields — no mapper,
+      no Object[] casting. `LEFT JOIN` keeps zero-review books (AVG→null, COUNT→0); missing
+      book → `Optional.empty` → 404. Verified live: 1 review→5.0/1, 0 reviews→null/0, after a
+      2nd review→4.0/2 (real averaging), bad id→404.
+
 ### Remaining (Phase 3)
-v2 book detail shape.
+Nothing — Phase 3 complete. ✅ (Optional carry-overs if desired later: keyset pagination on
+`/reviews` too; Jackson custom date format / `@JsonView`; widening ETags & `_links` to more
+endpoints. None blocking.)
 
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the

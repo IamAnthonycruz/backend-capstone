@@ -35,6 +35,12 @@ public class BookService {
         return bookRepository.findById(id).map(bookMapper::toResponseDTO);
     }
 
+    // v2 detail: the query builds the DTO directly (no mapper) — aggregates can't come
+    // from a single entity mapping.
+    public Optional<BookDetailV2DTO> findDetailById(UUID id) {
+        return bookRepository.findBookDetailById(id);
+    }
+
     public BookResponseDTO create(BookRequestDTO request) {
         Book saved = bookRepository.save(bookMapper.toEntity(request));
         return bookMapper.toResponseDTO(saved);

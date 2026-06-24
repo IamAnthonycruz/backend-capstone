@@ -3,8 +3,10 @@ package com.readshelf.book;
 import org.springframework.data.domain.Page;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 public interface BookRepository extends JpaRepository<Book, UUID> {
@@ -39,4 +41,12 @@ public interface BookRepository extends JpaRepository<Book, UUID> {
     @Query(value = bookWithAverageRatingAndReviewCountQuery, nativeQuery = true)
     List<Object[]> getAllBooksAverageRatingAndReviewCount();
 
+    // v2 book detail: one book's fields + review aggregates, built straight into the DTO.
+    @Query("SELECT new com.readshelf.book.BookDetailV2DTO(" +
+            "b.id, b.isbn, b.title, b.author, b.genre, b.summary, " +
+            "AVG(r.rating), COUNT(r.id)) " +
+            "FROM Book b LEFT JOIN b.reviews r " +
+            "WHERE b.id = :id " +
+            "GROUP BY b.id, b.isbn, b.title, b.author, b.genre, b.summary")
+    Optional<BookDetailV2DTO> findBookDetailById(@Param("id") UUID id);
 }
