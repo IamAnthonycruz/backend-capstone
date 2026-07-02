@@ -3,9 +3,11 @@ package com.readshelf.user;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
 
 public record UserRequestDTO(
         @NotBlank
+        @Size(max = 255)
         String username,
 
         @NotBlank
@@ -13,6 +15,7 @@ public record UserRequestDTO(
         String email,
 
         @NotBlank
+        @Size(min = 8)
         String password,
 
         // Restrict to the values the DB CHECK allows, so a bad role is a clean 400

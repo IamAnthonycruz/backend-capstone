@@ -10,8 +10,10 @@ public record BookRequestDTO(
         @ISBN
         String isbn,
         @NotBlank
+        @Size(max = 255)
         String title,
         @NotBlank
+        @Size(max = 255)
         String author,
         String genre,
         @Size(max = 200)

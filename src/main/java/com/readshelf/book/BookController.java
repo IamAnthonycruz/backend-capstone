@@ -10,6 +10,7 @@ import jakarta.validation.constraints.Min;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
@@ -93,11 +94,16 @@ public class BookController {
                 .orElseGet(()-> ResponseEntity.notFound().build());
     }
 
+    // TODO(human): only admins may delete any book. Add a method-level @PreAuthorize
+    // here. This is a pure ROLE check (the word "any" — owner doesn't matter), so it can
+    // be decided before the method runs. Hint: hasRole('...') matches the ROLE_<x>
+    // authority your JwtAuthFilter set, so pass the role name WITHOUT the ROLE_ prefix.
+    @PreAuthorize("hasRole('ADMIN')")
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> deleteBook(@PathVariable UUID id) {
         if(!bookService.delete(id)) {
             return ResponseEntity.notFound().build();
         }
-        return ResponseEntity.noContent().build(); // TODO(human)
+        return ResponseEntity.noContent().build();
     }
 }

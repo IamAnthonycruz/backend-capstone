@@ -5,6 +5,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
@@ -45,6 +46,12 @@ public class UserController {
         return ResponseEntity.created(location).body(created);
     }
 
+    // TODO(human): a user may only update THEIR OWN profile. Add @PreAuthorize comparing
+    // the current user's id against the {id} being updated. Both are available here:
+    //   - #id                      -> the path variable (a java.util.UUID)
+    //   - authentication.principal -> what JwtAuthFilter set (the userId as a String)
+    // Wrinkle: UUID != String, so == won't match as-is. Make the two sides the same type.
+    @PreAuthorize("authentication.principal == #id.toString()")
     @PutMapping("/{id}")
     public ResponseEntity<UserResponseDTO> updateUser(@PathVariable UUID id,
                                                       @Valid @RequestBody UserRequestDTO request) {

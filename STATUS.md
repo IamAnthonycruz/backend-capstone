@@ -1,6 +1,6 @@
 # ReadShelf — Status
 
-_Last updated: 2026-06-19_
+_Last updated: 2026-07-02_
 
 ## Where we are
 
@@ -15,6 +15,16 @@ MailHog), `dev`/`prod` profiles, `GET /api/v1/health`.
 param validation (all 6 list endpoints), 409-on-conflict, keyset/cursor pagination (loans),
 nested route (`/books/{id}/reviews`), ETags + 304, HATEOAS `_links` (loan), v2 book detail
 (URI versioning + JPQL aggregate). All verified live. See Phase 3 progress below.
+
+**Phase 4 (Validation & Transformation): COMPLETE.** Two hand-written custom constraints
+(`@NoSelfLoan` class-level, `@ValidDateRange` field-level with a `maxDays` window),
+Bean Validation coverage filled across all request DTOs, and a structured field→message
+error handler (`@RestControllerAdvice`). All verified live. See Phase 4 progress below.
+
+**Phase 5 (Authentication & Authorization): COMPLETE** (one item deferred to Phase 7).
+Stateless JWT (access + refresh **rotation** with reuse detection), `/api/v1/auth`
+register/login/refresh, BCrypt hashing, `@PreAuthorize` method security (role + ownership),
+`SecurityContextHolder` as request context. All verified live. See Phase 5 progress below.
 
 ## Phase 2 progress
 
@@ -125,6 +135,89 @@ Nothing — Phase 3 complete. ✅ (Optional carry-overs if desired later: keyset
 `/reviews` too; Jackson custom date format / `@JsonView`; widening ETags & `_links` to more
 endpoints. None blocking.)
 
+## Phase 4 progress
+
+### Done
+- [x] **Custom constraints live in `com.readshelf.validation`** — annotation + a
+      `ConstraintValidator` per constraint, wired via `@Constraint(validatedBy = ...)`.
+      Decision: did NOT build a custom `@ISBN` (README's example) — Hibernate's
+      `org.hibernate.validator.constraints.ISBN` already covers format; reinventing it
+      adds no value. Satisfied the "write a custom constraint" goal with two domain-useful
+      ones instead.
+- [x] **`@NoSelfLoan` (class-level)** on `LoanRequestDTO` — rejects `lenderId == borrowerId`.
+      Class-level (`@Target(TYPE)`) because the check is cross-field, so the validator's
+      target is the whole DTO (`ConstraintValidator<NoSelfLoan, LoanRequestDTO>`), not a
+      single field. `isValid` returns `true` on null value / null ids (lets `@NotNull` own
+      null-rejection — the Bean Validation idiom), compares with `.equals()` not `==`.
+      Produces a **global** error (no field), surfaced under the object-name key.
+- [x] **`@ValidDateRange` (field-level)** on `dueDate` — due date must fall within
+      `[now, now + maxDays]`, default `maxDays = 90`. Two bounds (not just `@Future`, which
+      only does "not past") so it's genuinely custom and earns the name; the `maxDays()`
+      annotation param is captured in `initialize()`. Inclusive bounds via `!isBefore(now)`
+      / `!isAfter(latest)`. Null `dueDate` → valid (optional field). `ConstraintValidator
+      <ValidDateRange, Instant>`.
+- [x] **Bean Validation coverage filled** across request DTOs. Principle locked: a
+      `@Size(max=...)` should **mirror the DB column width** where one exists, else it's an
+      API **policy** bound. `username` → `@Size(max=255)` (mirrors `VARCHAR(255)`);
+      `password` → `@Size(min=8)`, no max (DB is `TEXT`; security-policy floor); `title`/
+      `author` → `@Size(max=255)` (policy; DB is `TEXT`/unbounded); review `content` →
+      `@Size(max=3000)` (policy). FK ids already `@NotNull`, role `@Pattern`, rating
+      `@Min/@Max`, email `@Email` — left as-is.
+- [x] **Structured validation errors** — `system.ValidationExceptionHandler`
+      (`@RestControllerAdvice`) handles `MethodArgumentNotValidException` → `400` +
+      `Map<String,String>` of field→message. Walks BOTH `getFieldErrors()` (field-level)
+      and `getGlobalErrors()` (class-level like `@NoSelfLoan`, keyed by object name).
+      Verified live: self-loan → `{"loanRequestDTO": "..."}`, past due date →
+      `{"dueDate": "..."}`, and both-bad-at-once returns both keys in one 400 response.
+      NOTE: only `MethodArgumentNotValidException` (request bodies); param-validation
+      (`HandlerMethodValidationException`) not handled here yet. Global-error keys collide
+      if a DTO ever gets two class-level constraints — fine with one today.
+
+### Remaining (Phase 4)
+Nothing — Phase 4 complete. ✅ (Phase 8 will generalize `ValidationExceptionHandler` into
+the full RFC 7807 problem-detail `@ControllerAdvice` and may switch validation errors to 422.)
+
+## Phase 5 progress
+
+### Done
+- [x] **Stateless JWT security** (`config.SecurityConfig`) — replaces the old permit-all.
+      `SessionCreationPolicy.STATELESS`, CSRF off (token in header, not cookie),
+      `permitAll` on `/api/v1/auth/**` + health, `anyRequest().authenticated()` last.
+      Custom `authenticationEntryPoint` → clean 401 (no login-form redirect).
+      NOTE: **must `permitAll` the ERROR dispatch type** (`dispatcherTypeMatchers(
+      DispatcherType.ERROR)`) — `OncePerRequestFilter` skips the `/error` re-dispatch, so
+      without it every secured `sendError` (e.g. a 403 from `@PreAuthorize`) collapses to 401.
+- [x] **`JwtService`** — mint (jjwt 0.13) `sub`=userId, `role` claim, 15-min TTL; `parseClaims`
+      verifies signature + exp in one shot (throws on failure). HMAC key from `JwtProperties`
+      secret (`readshelf.security.jwt.*`, TTLs as `Duration`).
+- [x] **`JwtAuthFilter`** (`OncePerRequestFilter`, plain class — wired via `addFilterBefore`,
+      NOT `@Component`, to avoid double registration). Reads `Authorization: Bearer`, populates
+      `SecurityContext` (principal = userId String, authority = `ROLE_<role>`). Authenticates
+      only; never rejects — authorization is SecurityConfig's job.
+- [x] **`/api/v1/auth`** — `register` (forces role BORROWER, BCrypt hash, 409 on dup via
+      saveAndFlush/catch), `login` (uniform 401, returns access + refresh), `refresh` (rotation).
+- [x] **`@PreAuthorize` method security** (`@EnableMethodSecurity`). Role-only:
+      `hasRole('ADMIN')` on `DELETE /books/{id}`. Ownership:
+      `authentication.principal == #id.toString()` on `PUT /users/{id}`. Verified: own→200,
+      other→403, non-admin delete→403.
+- [x] **Refresh token rotation + reuse detection** — `refresh_tokens` table (V9):
+      `token_hash` (SHA-256, deterministic so it's lookup-able; raw value returned to client
+      once, never stored), `family_id` (rotation lineage), `expires_at` (7d), `revoked`.
+      `AuthService.refresh` = lookup-or-401 → reuse check (revoked row ⇒ `revokeFamily` + 401)
+      → expiry check → rotate (spend old, issue new in SAME family). Shared `issueRefreshToken`
+      helper (login = new family, refresh = same family). Verified live: rotate→200, chain
+      continues, replay of spent token→401 AND nukes the whole family (current token→401).
+      NOTE: method is `@Transactional(dontRollbackOn = ResponseStatusException.class)` — the
+      tx is needed for the `@Modifying revokeFamily` + to keep the lazy `RefreshToken.user`
+      proxy initializable; `dontRollbackOn` keeps the reuse-detection revoke from being rolled
+      back by the 401 throw.
+
+### Remaining (Phase 5)
+- 🔜 **2 of 4 `@PreAuthorize` rules deferred to Phase 7** — loan approve/reject (lender owns
+      the book) and loan cancel (borrower owns the loan) target loan state-transition endpoints
+      that don't exist yet. The ownership pattern is proven and ready to apply.
+- (Phase 8) Auth error bodies still leak a stack trace via `/error`; RFC 7807 will fix.
+
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the
   mapper + repo, takes/returns DTOs); Mapper = `@Component` implementing generic
@@ -133,10 +226,10 @@ endpoints. None blocking.)
 - See `phase2_crud_layering` memory for the full convention.
 
 ## ⚠️ Temporary / deferred
-- **`config.SecurityConfig` = permit-all + CSRF disabled** — DEV ONLY so CRUD is
-  testable without the default generated password. **MUST be replaced in Phase 5**
-  with stateless JWT + `@PreAuthorize`. (Spring Security is on the classpath.)
-- `@Transactional` on service write methods → Phase 7.
+- ~~`config.SecurityConfig` = permit-all~~ — **RESOLVED in Phase 5** (stateless JWT +
+  `@PreAuthorize`). See Phase 5 progress.
+- `@Transactional` on service write methods → Phase 7 (except `AuthService.refresh`, which
+  needed it now for rotation — see Phase 5 note).
 - 🔴 keyset/cursor pagination query (loans) → Phase 3.
 - ISBN normalization: `@ISBN` accepts hyphens, so the same ISBN in two formats can
   create two rows (UNIQUE doesn't catch it). Normalize-before-save → later.
@@ -145,7 +238,9 @@ endpoints. None blocking.)
 
 ## Phase boundary reminder
 Basic CRUD = Phase 2. REST polish (pagination, nested routes, 409, ETags, HATEOAS,
-v2 shapes) = Phase 3. Validation depth + custom constraints = Phase 4.
+v2 shapes) = Phase 3. Validation depth + custom constraints = Phase 4. Auth (JWT,
+refresh rotation, `@PreAuthorize`) = Phase 5. Loan state transitions + their ownership
+rules + service `@Transactional` = Phase 7.
 
 ## Working agreement
 Learning project. Claude handles scaffolding/config/boilerplate (incl. pure
