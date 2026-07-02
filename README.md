@@ -399,6 +399,5 @@ share titles). `BookCopy` is a physical copy a user owns and lends — it carrie
 
 Loan is its own entity (not a join table) because it carries state:
 status, request_date, approval_date, due_date, return_date, version.
-#   b a c k e n d - c a p s t o n e 
  
  
