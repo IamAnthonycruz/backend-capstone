@@ -1,6 +1,5 @@
 # ReadShelf — Community Book Lending & Review API
 
-
 A Spring Boot backend project that implements every concept from the
 "Backend from First Principles" playlist by Sriniously.
 
@@ -215,7 +214,7 @@ Difficulty rises with joins, aggregation, and pagination:
   - "Your borrow request was approved"
   - "Your book was returned"
 - [ ] Event flow: service → RabbitMQ → consumer → WebSocket push
-- [ ] Handles disconnected users gracefully (message is lost, not queued — 
+- [ ] Handles disconnected users gracefully (message is lost, not queued —
       or optionally stored for polling)
 
 ### Phase 15: GraphQL Layer (Bonus)
@@ -367,19 +366,19 @@ Difficulty rises with joins, aggregation, and pagination:
 
 ## Running Locally
 
-```bash
+\`\`\`bash
 # Start all backing services
 docker compose up -d
 
 # Run the app
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
-```
+\`\`\`
 
 ---
 
 ## Entity Relationship Summary
 
-```
+\`\`\`
 User 1---1 UserProfile             (One-to-One)
 Book 1---* BookCopy                 (One-to-Many: a work/edition has many physical copies)
 User 1---* BookCopy                 (One-to-Many: a user owns many copies)   [owner_id]
@@ -389,7 +388,7 @@ User *---* Book via Wishlist        (Many-to-Many: join entity with timestamp; w
 Loan → BookCopy                     (Many-to-One: a loan is for a specific physical copy)
 Loan → User (lender)                (Many-to-One)
 Loan → User (borrower)              (Many-to-One)
-```
+\`\`\`
 
 **Model A (catalog/copy split):** `Book` is the catalog entry — a work/edition,
 identified by `isbn` (unique; `title` is not, because translations and editions
@@ -399,5 +398,3 @@ share titles). `BookCopy` is a physical copy a user owns and lends — it carrie
 
 Loan is its own entity (not a join table) because it carries state:
 status, request_date, approval_date, due_date, return_date, version.
- 
- 
