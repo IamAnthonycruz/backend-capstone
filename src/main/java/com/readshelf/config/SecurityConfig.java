@@ -2,6 +2,7 @@ package com.readshelf.config;
 
 import com.readshelf.auth.JwtAuthFilter;
 import com.readshelf.auth.JwtService;
+import com.readshelf.web.RateLimitFilter;
 import jakarta.servlet.DispatcherType;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -13,6 +14,7 @@ import org.springframework.security.config.annotation.web.configuration.EnableWe
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
@@ -34,8 +36,10 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 public class SecurityConfig {
 
     @Bean
-    public SecurityFilterChain filterChain(HttpSecurity http, JwtService jwtService) throws Exception {
+    public SecurityFilterChain filterChain(HttpSecurity http, JwtService jwtService,
+                                           StringRedisTemplate redis) throws Exception {
         JwtAuthFilter jwtAuthFilter = new JwtAuthFilter(jwtService);
+        RateLimitFilter rateLimitFilter = new RateLimitFilter(redis);
 
         http
                 .csrf(csrf -> csrf.disable())
@@ -55,7 +59,11 @@ public class SecurityConfig {
                 // Unauthenticated hit on a protected route -> clean 401 (no login-form redirect).
                 .exceptionHandling(eh -> eh.authenticationEntryPoint(
                         (request, response, ex) -> response.sendError(HttpServletResponse.SC_UNAUTHORIZED)))
-                .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+                .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+                // RateLimitFilter runs immediately AFTER JwtAuthFilter, so the SecurityContext
+                // is already populated and we can rate-limit by authenticated user id (falling
+                // back to IP for anonymous traffic like login/register).
+                .addFilterAfter(rateLimitFilter, JwtAuthFilter.class);
 
         return http.build();
     }
