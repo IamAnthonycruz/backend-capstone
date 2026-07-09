@@ -75,6 +75,15 @@ server:
   port: ${SERVER_PORT:8080}
   shutdown: graceful
 
+# --- Logging ---
+# %X{correlationId} pulls the id CorrelationIdFilter puts in MDC into every log line, so a
+# whole request can be grep'd by its id. The `:-` default keeps off-request lines (startup,
+# scheduled jobs) from printing an empty-key placeholder. Full structured JSON logging via
+# logback-spring.xml comes in Phase 18; this is the lightweight interim.
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] [%X{correlationId:-}] %-5level %logger{36} - %msg%n"
+
 # --- Object storage (MinIO) ---
 # No Spring auto-configuration exists for MinIO; these keys are bound by a
 # @ConfigurationProperties class added in the object-storage phase.

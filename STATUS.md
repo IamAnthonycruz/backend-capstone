@@ -1,6 +1,6 @@
 # ReadShelf — Status
 
-_Last updated: 2026-07-02_
+_Last updated: 2026-07-08_
 
 ## Where we are
 
@@ -25,6 +25,12 @@ error handler (`@RestControllerAdvice`). All verified live. See Phase 4 progress
 Stateless JWT (access + refresh **rotation** with reuse detection), `/api/v1/auth`
 register/login/refresh, BCrypt hashing, `@PreAuthorize` method security (role + ownership),
 `SecurityContextHolder` as request context. All verified live. See Phase 5 progress below.
+
+**Phase 6 (Middlewares & Request Context): COMPLETE.** Four cross-cutting pieces in a new
+`com.readshelf.web` package: `CorrelationIdFilter` (honor-and-validate inbound id → MDC +
+response header), `RequestLoggingFilter` (one access-log line per request), `RateLimitFilter`
+(per-user/-IP Redis sorted-set sliding window, 429 on overflow), and a `RequestContext` facade.
+Explicit filter ordering across BOTH chains. All verified live. See Phase 6 progress below.
 
 ## Phase 2 progress
 
@@ -218,6 +224,46 @@ the full RFC 7807 problem-detail `@ControllerAdvice` and may switch validation e
       that don't exist yet. The ownership pattern is proven and ready to apply.
 - (Phase 8) Auth error bodies still leak a stack trace via `/error`; RFC 7807 will fix.
 
+## Phase 6 progress
+
+### Done
+- [x] **`CorrelationIdFilter`** (`@Component`, `@Order(HIGHEST_PRECEDENCE)`) — OUTER servlet
+      chain, runs BEFORE Spring Security so even a 401 carries an id. **Honors an inbound
+      `X-Correlation-Id`** but validates it permissively (allowlist `^[a-zA-Z0-9_\-]{1,50}$`
+      — defeats oversized values + log injection); invalid/absent → fresh `UUID`. Puts id in
+      MDC + response header. **MDC cleared in `finally`** (ThreadLocal + pooled threads → would
+      leak into the next request otherwise). Verified: valid id echoed, bad-chars/too-long → fresh.
+- [x] **`RequestLoggingFilter`** (`@Component`, `@Order(HIGHEST_PRECEDENCE + 1)`) — one
+      access-log line per request AFTER the chain (status + duration only exist post-handling),
+      in a `finally` (a throwing request still logs). `log.info("{} {} -> {} ({}ms)", ...)` with
+      SLF4J placeholders (lazy render). Correlation id rides along via MDC, not the message.
+- [x] **`RateLimitFilter`** (NOT `@Component` — hand-wired `addFilterAfter(JwtAuthFilter.class)`
+      so the SecurityContext is populated and we can key by user). Redis **sorted-set sliding
+      window log**, "fair" semantic: `ZREMRANGEBYSCORE` evict → `ZCARD` count → **reject 429 WITHOUT
+      recording** (recording rejects = penalty semantic; skipping = window drains on schedule) →
+      else `ZADD` (member `now-<uuid>`, unique) → `EXPIRE` (idle keys self-clean). Key =
+      `ratelimit:user:<id>` or `ratelimit:ip:<addr>` fallback (bounds anonymous login/register
+      abuse). 100/min. Verified live: 100×200 then 429; Redis ZCARD=100 (not 103) proves rejects
+      unrecorded; TTL set. NOTE: 3 separate round-trips → not atomic under load (two can pass the
+      count check); atomic version is a single Lua script — flagged, not built. `getRemoteAddr()`
+      is the proxy IP behind a LB (`X-Forwarded-For` is the hardening fix) — flagged.
+- [x] **`RequestContext`** — `final`, private-ctor, all-static facade over the per-request
+      thread-locals. `currentUserId()` → `Optional<String>` (empty when anon — guards the
+      `AnonymousAuthenticationToken` whose `isAuthenticated()==true`/principal `"anonymousUser"`),
+      `currentRoles()` → `Set<String>` (ROLE_ prefix stripped, unmodifiable), `correlationId()`
+      → reads `MDC`. `RateLimitFilter.resolveClientId` refactored to use it (DRY, proves it works).
+      NOTE: thread-local — an `@Async` thread won't inherit it (gotcha for later phases).
+- [x] **Explicit filter ordering** across both chains: OUTER `CorrelationIdFilter` →
+      `RequestLoggingFilter` → (Spring Security `FilterChainProxy`: `JwtAuthFilter` →
+      `RateLimitFilter`) → controllers.
+- [x] **Logging pattern** — `logging.pattern.console` in `application.yml` adds
+      `%X{correlationId:-}` so the id appears IN each log line (was invisible on the default
+      pattern). Interim; full structured-JSON `logback-spring.xml` is Phase 18.
+
+### Remaining (Phase 6)
+Nothing — Phase 6 complete. ✅ (Carry-overs, non-blocking: atomic rate-limit via Lua script;
+`X-Forwarded-For` real-client-IP; rate-limit config as `@ConfigurationProperties` vs constants.)
+
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the
   mapper + repo, takes/returns DTOs); Mapper = `@Component` implementing generic
@@ -235,12 +281,16 @@ the full RFC 7807 problem-detail `@ControllerAdvice` and may switch validation e
   create two rows (UNIQUE doesn't catch it). Normalize-before-save → later.
 - Naming nit: `utils.ObjectMapper` collides conceptually with Jackson's `ObjectMapper`
   (suggested rename to `EntityMapper`, not yet done).
+- Rate limiter (Phase 6): not atomic (3 round-trips) → Lua script later; `getRemoteAddr()`
+  is the proxy IP behind a LB → `X-Forwarded-For` later; limits are constants → could be
+  `@ConfigurationProperties`. Full structured-JSON logging (`logback-spring.xml`) → Phase 18.
 
 ## Phase boundary reminder
 Basic CRUD = Phase 2. REST polish (pagination, nested routes, 409, ETags, HATEOAS,
 v2 shapes) = Phase 3. Validation depth + custom constraints = Phase 4. Auth (JWT,
-refresh rotation, `@PreAuthorize`) = Phase 5. Loan state transitions + their ownership
-rules + service `@Transactional` = Phase 7.
+refresh rotation, `@PreAuthorize`) = Phase 5. Cross-cutting filters + request context
+(correlation id, request logging, rate limit, `RequestContext`) = Phase 6. Loan state
+transitions + their ownership rules + service `@Transactional` = Phase 7.
 
 ## Working agreement
 Learning project. Claude handles scaffolding/config/boilerplate (incl. pure
