@@ -3,10 +3,13 @@ package com.readshelf.loan;
 import com.readshelf.utils.CursorPage;
 import com.readshelf.utils.Link;
 import com.readshelf.utils.PagedResponse;
+import com.readshelf.web.RequestContext;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
@@ -88,8 +91,36 @@ public class LoanController {
         return ResponseEntity.created(location).body(created);
     }
 
-    // No generic PUT — status transitions (approve/activate/return) are Phase 7
-    // dedicated endpoints, e.g. POST /api/v1/loans/{id}/approve.
+    // --- State transitions (Phase 7) ---
+    // Each is a dedicated action endpoint (not a blunt PUT). The caller's identity comes
+    // from the security context; the service uses it to authorize the specific transition.
+
+    @PostMapping("/{id}/approve")
+    public ResponseEntity<LoanResponseDTO> approveLoan(@PathVariable UUID id) {
+        UUID callerId = currentUserId();
+        return ResponseEntity.ok(loanService.approve(id, callerId));
+    }
+
+    // APPROVED -> ACTIVE. Borrower confirms they now physically have the copy.
+    @PostMapping("/{id}/pickup")
+    public ResponseEntity<LoanResponseDTO> pickupLoan(@PathVariable UUID id) {
+        UUID callerId = currentUserId();
+        return ResponseEntity.ok(loanService.pickup(id, callerId));
+    }
+
+    // ACTIVE -> RETURNED. Borrower hands the copy back; the copy becomes available again.
+    @PostMapping("/{id}/return")
+    public ResponseEntity<LoanResponseDTO> returnLoan(@PathVariable UUID id) {
+        UUID callerId = currentUserId();
+        return ResponseEntity.ok(loanService.returnLoan(id, callerId));
+    }
+
+    // Authenticated by SecurityConfig (anyRequest().authenticated()), so this is always present.
+    private UUID currentUserId() {
+        return RequestContext.currentUserId()
+                .map(UUID::fromString)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED));
+    }
 
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> deleteLoan(@PathVariable UUID id) {

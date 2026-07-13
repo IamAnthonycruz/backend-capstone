@@ -2,6 +2,7 @@ package com.readshelf.system;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -31,5 +32,14 @@ public class ValidationExceptionHandler {
                 errors.put(error.getObjectName(), error.getDefaultMessage());
             }
         return errors;
+    }
+
+    @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public Map<String, String> handleOptimisticLockingFailure(ObjectOptimisticLockingFailureException ex) {
+        Map<String, String> error = new HashMap<>();
+        error.put("error", "Conflict");
+        error.put("message", "The record you are trying to update was modified by another user. Please reload and try again.");
+        return error;
     }
 }

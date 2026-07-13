@@ -2,6 +2,7 @@ package com.readshelf.review;
 
 import com.readshelf.book.Book;
 import com.readshelf.book.BookRepository;
+import com.readshelf.loan.LoanRepository;
 import com.readshelf.user.User;
 import com.readshelf.user.UserRepository;
 import com.readshelf.utils.PagedResponse;
@@ -27,15 +28,18 @@ public class ReviewService {
     private final ReviewRepository reviewRepository;
     private final UserRepository userRepository;
     private final BookRepository bookRepository;
+    private final LoanRepository loanRepository;
     private final ReviewMapper reviewMapper;
 
     public ReviewService(ReviewRepository reviewRepository,
                          UserRepository userRepository,
                          BookRepository bookRepository,
+                         LoanRepository loanRepository,
                          ReviewMapper reviewMapper) {
         this.reviewRepository = reviewRepository;
         this.userRepository = userRepository;
         this.bookRepository = bookRepository;
+        this.loanRepository = loanRepository;
         this.reviewMapper = reviewMapper;
     }
 
@@ -60,6 +64,10 @@ public class ReviewService {
         User user = resolveUser(request.userId());
         Book book = resolveBook(request.bookId());
 
+        // You can only review a work you've actually borrowed (picked-up: see LoanRepository).
+        if(!loanRepository.hasEverBorrowed(user.getId(), book.getId())) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You cannot review a book you have not yet borrowed");
+        }
         Review review = reviewMapper.toEntity(request);
         review.setUser(user);
         review.setBook(book);

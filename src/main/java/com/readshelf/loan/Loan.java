@@ -43,6 +43,12 @@ public class Loan {
     @Column(name = "return_date")
     private Instant returnDate;
 
+    // Optimistic-locking version. Hibernate bumps it on every update and guards the
+    // UPDATE with `WHERE version = ?`; a stale write loses -> OptimisticLockingFailureException.
+    @Version
+    @Column(name = "version", nullable = false)
+    private long version;
+
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "lender_id", referencedColumnName = "id", nullable = false)
     private User lender;
