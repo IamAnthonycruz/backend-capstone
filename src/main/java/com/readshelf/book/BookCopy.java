@@ -29,6 +29,12 @@ public class BookCopy {
     @Column(name = "is_available", nullable = false)
     private boolean isAvailable = true;
 
+    // Optimistic-locking version — the race point of the whole app: two borrowers
+    // picking up the same copy. One bumps version, the other's stale write loses (409).
+    @Version
+    @Column(name = "version", nullable = false)
+    private long version;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;

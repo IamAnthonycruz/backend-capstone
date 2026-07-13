@@ -1,6 +1,6 @@
 # ReadShelf — Status
 
-_Last updated: 2026-07-08_
+_Last updated: 2026-07-13_
 
 ## Where we are
 
@@ -31,6 +31,15 @@ register/login/refresh, BCrypt hashing, `@PreAuthorize` method security (role + 
 response header), `RequestLoggingFilter` (one access-log line per request), `RateLimitFilter`
 (per-user/-IP Redis sorted-set sliding window, 429 on overflow), and a `RequestContext` facade.
 Explicit filter ordering across BOTH chains. All verified live. See Phase 6 progress below.
+
+**Phase 7 (Business Logic Layer): COMPLETE.** Domain rules now live in the services.
+`LoanService` gained create-time guards (can't borrow your own copy, copy must be available,
+max 3 "active" loans) and the loan state machine as dedicated action endpoints
+(`approve`/`pickup`/`return`) — each guarded by role (403) + current state (409).
+`ReviewService` enforces "review only a work you've borrowed" via an encapsulated loan-side
+query. Optimistic locking (`@Version`) on `Loan` + `BookCopy` (migration V10), with a lost
+race mapped to 409. `@Transactional` on the two-entity writes. Code-complete + compiles; the
+concurrency *load test* is deliberately left to Phase 21. See Phase 7 progress below.
 
 ## Phase 2 progress
 
@@ -219,9 +228,9 @@ the full RFC 7807 problem-detail `@ControllerAdvice` and may switch validation e
       back by the 401 throw.
 
 ### Remaining (Phase 5)
-- 🔜 **2 of 4 `@PreAuthorize` rules deferred to Phase 7** — loan approve/reject (lender owns
-      the book) and loan cancel (borrower owns the loan) target loan state-transition endpoints
-      that don't exist yet. The ownership pattern is proven and ready to apply.
+- ~~🔜 2 of 4 `@PreAuthorize` rules deferred to Phase 7~~ — **RESOLVED in Phase 7**, but via
+      *in-service* authz (Decision A), not `@PreAuthorize`: loan-transition ownership is
+      relationship-based (needs the loaded loan), so it lives in the service. See Phase 7 progress.
 - (Phase 8) Auth error bodies still leak a stack trace via `/error`; RFC 7807 will fix.
 
 ## Phase 6 progress
@@ -264,6 +273,56 @@ the full RFC 7807 problem-detail `@ControllerAdvice` and may switch validation e
 Nothing — Phase 6 complete. ✅ (Carry-overs, non-blocking: atomic rate-limit via Lua script;
 `X-Forwarded-For` real-client-IP; rate-limit config as `@ConfigurationProperties` vs constants.)
 
+## Phase 7 progress
+
+### Done
+- [x] **`LoanService` create-time rules** (in `create`, after FK resolution, before save):
+      (1) can't borrow a copy you own — `bookCopy.getOwner().getId().equals(borrower.getId())`
+      → **403** (compare IDs, not entities: `User` has no `equals()`, and `create` isn't
+      `@Transactional` so the two `User` loads needn't be the same instance); (2) copy must be
+      available → **409**; (3) max active loans → **409**, via
+      `loanRepository.countByBorrower_IdAndStatusIn(borrowerId, {APPROVED, ACTIVE, OVERDUE})`
+      against `MAX_ACTIVE_LOANS = 3`. **Decision:** "active" = *tying up a copy*
+      (APPROVED/ACTIVE/OVERDUE), not just physically-held — because approval already reserves
+      the copy (`is_available=false`). REQUESTED/RETURNED don't count. `lender != borrower` is
+      still enforced upstream by `@NoSelfLoan` (400).
+- [x] **Loan state machine as action endpoints** (`POST /loans/{id}/approve|pickup|return`,
+      not a blunt PUT). Each follows a 4-beat skeleton: **LOAD** (404) → **AUTHZ** (403) →
+      **GUARD** state (409) → **MUTATE** (status + timestamps + copy, save). `approve`
+      (REQUESTED→APPROVED, lender only): re-checks copy availability, stamps `approvalDate`,
+      **reserves the copy** (`is_available=false`). `pickup` (APPROVED→ACTIVE, borrower only):
+      borrower confirms possession; touches only the loan. `returnLoan` (ACTIVE→RETURNED,
+      borrower only): stamps `returnDate`, **frees the copy** (`is_available=true`).
+      **Decision:** reserve at *approval* (not pickup) so double-booking is caught early.
+      Caller id comes from `RequestContext.currentUserId()` in the controller.
+- [x] **`ReviewService`: review only a work you've borrowed** — `create` calls
+      `loanRepository.hasEverBorrowed(userId, bookId)` before saving; false → **403**.
+      **Decision:** "borrowed" = *ever picked up* (ACTIVE/OVERDUE/RETURNED), keyed on pickup as
+      the moment of possession — not REQUESTED/APPROVED. **Boundary decision:** the "what counts
+      as borrowed" policy is baked into a loan-side `@Query` (`hasEverBorrowed` navigates
+      loan→bookCopy→book) rather than exposing the package-private `LoanStatus` to the `review`
+      package. One-review-per-work stays the existing DB `UNIQUE` + `catch`→409.
+- [x] **Optimistic locking** — `@Version long version` on `Loan` and `BookCopy` (migration
+      **V10**, `BIGINT NOT NULL DEFAULT 0`). The race point is two approvals reserving the same
+      copy: both read `version=0`, both flip `is_available`, first commit bumps to 1, the second's
+      `UPDATE … WHERE version=0` matches 0 rows → `ObjectOptimisticLockingFailureException`. Now
+      mapped to **409** by a new handler in `system.ValidationExceptionHandler` (was an unhandled
+      500). Formal concurrency proof is Phase 21.
+- [x] **`@Transactional`** (jakarta) on the two-entity writes (`approve`, `returnLoan`) so the
+      loan + copy mutations commit atomically and dirty-checking flushes the copy without an
+      explicit save. `pickup` (one entity) uses `saveAndFlush`.
+- [x] **Authorization stays in-service (Decision A).** Loan-transition authz is
+      *relationship-based* (caller must be the loaded loan's lender/borrower), so it lives in the
+      service next to the state guard — NOT `@PreAuthorize`. Rejected the security-bean approach
+      (`@loanSecurity.canApprove(#id, auth)`) because it re-loads the loan on every action for no
+      benefit. This resolves the 2 `@PreAuthorize` rules Phase 5 deferred.
+
+### Remaining (Phase 7)
+Nothing — Phase 7 complete. ✅ NOTE: `returnLoan` only allows ACTIVE→RETURNED; once Phase 11
+introduces the scheduled OVERDUE checker, widen that guard to accept OVERDUE too. The
+concurrency/load proof (one of N concurrent borrowers wins) is Phase 21; unit/repo/API tests
+are Phase 22.
+
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the
   mapper + repo, takes/returns DTOs); Mapper = `@Component` implementing generic
@@ -274,8 +333,9 @@ Nothing — Phase 6 complete. ✅ (Carry-overs, non-blocking: atomic rate-limit 
 ## ⚠️ Temporary / deferred
 - ~~`config.SecurityConfig` = permit-all~~ — **RESOLVED in Phase 5** (stateless JWT +
   `@PreAuthorize`). See Phase 5 progress.
-- `@Transactional` on service write methods → Phase 7 (except `AuthService.refresh`, which
-  needed it now for rotation — see Phase 5 note).
+- ~~`@Transactional` on service write methods → Phase 7~~ — **RESOLVED in Phase 7** on the
+  two-entity loan writes (`approve`, `returnLoan`). Single-entity writes still rely on
+  `save`/`saveAndFlush`'s own tx.
 - 🔴 keyset/cursor pagination query (loans) → Phase 3.
 - ISBN normalization: `@ISBN` accepts hyphens, so the same ISBN in two formats can
   create two rows (UNIQUE doesn't catch it). Normalize-before-save → later.
