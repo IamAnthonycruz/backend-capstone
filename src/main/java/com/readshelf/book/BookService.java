@@ -31,8 +31,10 @@ public class BookService {
         this.bookMapper = bookMapper;
     }
 
-    public Optional<BookResponseDTO> findById(UUID id) {
-        return bookRepository.findById(id).map(bookMapper::toResponseDTO);
+    public BookResponseDTO getById(UUID id) {
+        return bookRepository.findById(id)
+                .map(bookMapper::toResponseDTO)
+                .orElseThrow(() -> new BookNotFoundException(id));
     }
 
     // v2 detail: the query builds the DTO directly (no mapper) — aggregates can't come
@@ -51,12 +53,9 @@ public class BookService {
         return PagedResponse.from(bookRepository.findAll(pageable).map(bookMapper::toResponseDTO));
     }
 
-    public Optional<BookResponseDTO> update(UUID id, BookRequestDTO request) {
-        Optional<Book> optionalBook = bookRepository.findById(id);
-        if(optionalBook.isEmpty()){
-            return Optional.empty();
-        }
-        Book book = optionalBook.get();
+    public BookResponseDTO update(UUID id, BookRequestDTO request) {
+        Book book = bookRepository.findById(id)
+                .orElseThrow(() -> new BookNotFoundException(id));
         book.setSummary(request.summary());
         book.setIsbn(request.isbn());
         book.setTitle(request.title());
@@ -64,14 +63,13 @@ public class BookService {
         book.setGenre(request.genre());
         bookRepository.save(book);
 
-        return Optional.of(bookMapper.toResponseDTO(book));
+        return bookMapper.toResponseDTO(book);
     }
 
-    public boolean delete(UUID id) {
-       if(!bookRepository.existsById(id)){
-           return false;
-       }
-       bookRepository.deleteById(id);
-       return true;
+    public void delete(UUID id) {
+        if (!bookRepository.existsById(id)) {
+            throw new BookNotFoundException(id);
+        }
+        bookRepository.deleteById(id);
     }
 }

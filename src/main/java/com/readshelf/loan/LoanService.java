@@ -89,26 +89,23 @@ public class LoanService {
         User borrower = resolveUser(request.borrowerId());
         BookCopy bookCopy = resolveBookCopy(request.bookCopyId());
 
-        // 1. Can't borrow a copy you own (Forbidden: You aren't allowed to do this)
+        // 1. Can't borrow a copy you own. One-off precondition (fires only here), so it
+        //    stays an inline ResponseStatusException rather than a named domain exception —
+        //    the advice still renders it as a ProblemDetail (403).
         if (bookCopy.getOwner().getId().equals(borrower.getId())) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You cannot borrow a book copy that you own.");
         }
 
-        // 2. Copy must be available (Conflict: The resource is in an incompatible state)
+        // 2. Copy must be available -> 409
         if (!bookCopy.isAvailable()) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "This book copy is currently unavailable for loan.");
+            throw new BookAlreadyLentException(bookCopy.getId());
         }
 
-        // 3. Max active loans per borrower (Too Many Requests / Unprocessable Entity: Quota exceeded)
+        // 3. Max active loans per borrower -> 409
         var loanStates = Set.of(LoanStatus.ACTIVE, LoanStatus.APPROVED, LoanStatus.OVERDUE);
-         // Adjust this limit as needed for your application
-
         long activeLoanCount = loanRepository.countByBorrower_IdAndStatusIn(borrower.getId(), loanStates);
         if (activeLoanCount >= MAX_ACTIVE_LOANS) {
-            throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "Loan limit reached. You cannot have more than " + MAX_ACTIVE_LOANS + " active loans at a time."
-            );
+            throw new LoanLimitExceededException(borrower.getId(), MAX_ACTIVE_LOANS);
         }
 
         // Map, build, and save the loan
@@ -134,15 +131,15 @@ public class LoanService {
      */
     @Transactional
     public LoanResponseDTO approve(UUID loanId, UUID callerId) {
-        Loan loan = loanRepository.findById(loanId).orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+        Loan loan = loanRepository.findById(loanId).orElseThrow(() -> new LoanNotFoundException(loanId));
         if (!callerId.equals(loan.getLender().getId())){
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN);
+            throw new UnauthorizedLoanActionException(loanId, "approve");
         }
         if (loan.getStatus() != LoanStatus.REQUESTED) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT);
+            throw new IllegalLoanStateException(loanId, loan.getStatus(), LoanStatus.REQUESTED);
         }
         if (!loan.getBookCopy().isAvailable()){
-            throw new  ResponseStatusException(HttpStatus.CONFLICT);
+            throw new BookAlreadyLentException(loan.getBookCopy().getId());
         }
         loan.setStatus(LoanStatus.APPROVED);
         loan.setApprovalDate(Instant.now());
@@ -159,12 +156,12 @@ public class LoanService {
      *     still needs @Transactional.
      */
     public LoanResponseDTO pickup(UUID loanId, UUID callerId) {
-        Loan loan =  loanRepository.findById(loanId).orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+        Loan loan =  loanRepository.findById(loanId).orElseThrow(() -> new LoanNotFoundException(loanId));
         if (!callerId.equals( loan.getBorrower().getId())) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN);
+            throw new UnauthorizedLoanActionException(loanId, "pick up");
         }
         if(loan.getStatus() != LoanStatus.APPROVED){
-            throw new ResponseStatusException(HttpStatus.CONFLICT);
+            throw new IllegalLoanStateException(loanId, loan.getStatus(), LoanStatus.APPROVED);
         }
         loan.setStatus(LoanStatus.ACTIVE);
         loanRepository.saveAndFlush(loan);
@@ -179,12 +176,12 @@ public class LoanService {
      */
     @Transactional
     public LoanResponseDTO returnLoan(UUID loanId, UUID callerId) {
-        Loan loan =   loanRepository.findById(loanId).orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+        Loan loan =   loanRepository.findById(loanId).orElseThrow(() -> new LoanNotFoundException(loanId));
         if  (!callerId.equals(loan.getBorrower().getId())) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN);
+            throw new UnauthorizedLoanActionException(loanId, "return");
         }
         if (loan.getStatus() != LoanStatus.ACTIVE){
-            throw new ResponseStatusException(HttpStatus.CONFLICT);
+            throw new IllegalLoanStateException(loanId, loan.getStatus(), LoanStatus.ACTIVE);
         }
         loan.setStatus(LoanStatus.RETURNED);
         loan.setReturnDate(Instant.now());

@@ -4,6 +4,9 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.NonNull;
@@ -30,6 +33,7 @@ import java.util.UUID;
  */
 public class RateLimitFilter extends OncePerRequestFilter {
 
+    private static final Logger log = LoggerFactory.getLogger(RateLimitFilter.class);
     private static final int MAX_REQUESTS = 100;
     private static final Duration WINDOW = Duration.ofMinutes(1);
     private static final String KEY_PREFIX = "ratelimit:";
@@ -49,20 +53,31 @@ public class RateLimitFilter extends OncePerRequestFilter {
         String key = KEY_PREFIX + resolveClientId(request);
         long now = System.currentTimeMillis();
         long windowStart = now - WINDOW.toMillis();
-        redis.opsForZSet().removeRangeByScore(key, 0, windowStart);
-        Long requestCounts = redis.opsForZSet().zCard(key);
-        long count = (requestCounts != null) ? requestCounts : 0;
-         if (count >= MAX_REQUESTS) {
-             response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
-             response.setContentType("text/plain");
-             response.getWriter().write("Too many requests. Please try again later.");
-             return;
-         }
-         String member = now + "-" + UUID.randomUUID();
-         redis.opsForZSet().add(key, member, now);
-         redis.expire(key, WINDOW);
-         filterChain.doFilter(request, response);
 
+        // Fail-open: the rate limiter protects against abuse, it must not itself become a
+        // hard dependency. If Redis is unreachable we log and let the request through
+        // rather than turning a cache outage into a full API outage. Catch DataAccessException
+        // (Spring wraps RedisConnectionFailureException in it), NOT bare Exception, so a real
+        // bug still surfaces instead of silently disabling the limiter.
+        try {
+            redis.opsForZSet().removeRangeByScore(key, 0, windowStart);
+            Long requestCounts = redis.opsForZSet().zCard(key);
+            long count = (requestCounts != null) ? requestCounts : 0;
+            if (count >= MAX_REQUESTS) {
+                response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+                response.setContentType("text/plain");
+                response.getWriter().write("Too many requests. Please try again later.");
+                return; // over limit: reject, do NOT continue the chain
+            }
+            String member = now + "-" + UUID.randomUUID();
+            redis.opsForZSet().add(key, member, now);
+            redis.expire(key, WINDOW);
+        } catch (DataAccessException e) {
+            log.warn("Rate limiter Redis unavailable, failing open for key {}: {}", key, e.getMessage());
+        }
+
+        // Reached by both the allowed path and the fail-open path (never after a 429).
+        filterChain.doFilter(request, response);
     }
 
     /**
