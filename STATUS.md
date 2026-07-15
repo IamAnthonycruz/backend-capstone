@@ -1,6 +1,6 @@
 # ReadShelf — Status
 
-_Last updated: 2026-07-13_
+_Last updated: 2026-07-14_
 
 ## Where we are
 
@@ -40,6 +40,17 @@ max 3 "active" loans) and the loan state machine as dedicated action endpoints
 query. Optimistic locking (`@Version`) on `Loan` + `BookCopy` (migration V10), with a lost
 race mapped to 409. `@Transactional` on the two-entity writes. Code-complete + compiles; the
 concurrency *load test* is deliberately left to Phase 21. See Phase 7 progress below.
+
+**Phase 8 (Error Handling): COMPLETE.** One global `@RestControllerAdvice`
+(`system.GlobalExceptionHandler`) extending `ResponseEntityExceptionHandler`, emitting
+RFC 7807 `ProblemDetail` (`application/problem+json`) as the single error shape. Six
+HTTP-agnostic domain exceptions (`BookNotFoundException`, `BookAlreadyLentException`,
+`LoanLimitExceededException`, `UnauthorizedLoanActionException` + `LoanNotFoundException`,
+`IllegalLoanStateException`), wired through `LoanService`/`BookService`. Validation → **422**
+(override) with field errors as an `errors` extension member; optimistic lock → 409;
+framework errors (malformed body, etc.) inherited as ProblemDetail for free. `RateLimitFilter`
+now **fails open** when Redis is unreachable. Old `ValidationExceptionHandler` retired. All
+verified live (422/400/404 all returned `problem+json`). See Phase 8 progress below.
 
 ## Phase 2 progress
 
@@ -189,8 +200,8 @@ endpoints. None blocking.)
       if a DTO ever gets two class-level constraints — fine with one today.
 
 ### Remaining (Phase 4)
-Nothing — Phase 4 complete. ✅ (Phase 8 will generalize `ValidationExceptionHandler` into
-the full RFC 7807 problem-detail `@ControllerAdvice` and may switch validation errors to 422.)
+Nothing — Phase 4 complete. ✅ (`ValidationExceptionHandler` was generalized into the RFC 7807
+`GlobalExceptionHandler` and validation errors switched to 422 — **done in Phase 8**.)
 
 ## Phase 5 progress
 
@@ -323,6 +334,60 @@ introduces the scheduled OVERDUE checker, widen that guard to accept OVERDUE too
 concurrency/load proof (one of N concurrent borrowers wins) is Phase 21; unit/repo/API tests
 are Phase 22.
 
+## Phase 8 progress
+
+### Done
+- [x] **One global advice** — `system.GlobalExceptionHandler` (`@RestControllerAdvice`)
+      **extends `ResponseEntityExceptionHandler`**. Decision: extend (not hand-roll) so we
+      inherit Spring's `ProblemDetail` handling for ~15 framework exceptions (malformed body,
+      missing params, type mismatch, ...) and only override what we want. Retired the old
+      `ValidationExceptionHandler` (can't have two advices handling the same exception type).
+- [x] **RFC 7807 everywhere** — every error is `application/problem+json` with `type`/`title`/
+      `status`/`detail` (+ auto `instance`). `type` is a **root-relative** slug
+      (`/problems/<x>`) — chosen over relative (`errors/<x>` resolves against the request URL,
+      so the same error would render a different `type` per endpoint — defeats the stable key).
+- [x] **Six domain exceptions, HTTP-agnostic** (no `HttpStatus` inside — the advice owns the
+      mapping). Flat `RuntimeException` subclasses in their **feature packages** (package-by-
+      feature, consistent with the rest of the repo), each carrying context + a `super(message)`
+      that becomes the `detail`:
+      - `book.BookNotFoundException` → 404
+      - `loan.BookAlreadyLentException` (copy unavailable, in the *loan* pkg — it's a lending
+        rule) → 409
+      - `loan.LoanLimitExceededException` (carries borrowerId + max) → 409
+      - `loan.UnauthorizedLoanActionException` (carries loanId + action) → 403
+      - `loan.LoanNotFoundException` → 404  *(beyond README — reused by all 3 transitions)*
+      - `loan.IllegalLoanStateException` (carries loanId + current + required state) → 409
+        *(beyond README — wrong-state transitions)*
+      **Heuristic locked:** named class when the failure is a domain concept reused across call
+      sites or carries context; **inline `ResponseStatusException` for one-offs** (e.g. "can't
+      borrow your own copy" — fires once, stays inline; Spring still renders it as ProblemDetail).
+- [x] **Wiring** — `LoanService` create + all 3 transitions throw the domain exceptions;
+      `BookService`/`BookController` not-found moved OUT of the controller (`Optional` →
+      `notFound()`) INTO the service as `BookNotFoundException` (so `update`/`delete`/`getById`
+      all flow through the advice). Other entities (User/BookCopy/Review/Wishlist) still 404 via
+      the controller `Optional` pattern — see deferred.
+- [x] **Validation → 422** — overrode `handleMethodArgumentNotValid` to return
+      `UNPROCESSABLE_ENTITY` (was 400) and attach the field→message + global-error walk as an
+      `errors` **extension member** (`pd.setProperty("errors", ...)`).
+- [x] **Optimistic lock → 409** — ported from the old handler, now a `ProblemDetail`.
+- [x] **Downstream failure handling: Redis fail-open** — `RateLimitFilter` wraps the Redis
+      section in `try/catch (DataAccessException)`; on outage it logs a warning and lets the
+      request PROCEED (rate limiter must not become a hard dependency — a cache blip shouldn't
+      take the whole API down). `filterChain.doFilter` moved below the try so the allowed path
+      and the fail-open path both reach it once, while the 429 path still returns early. Catch is
+      `DataAccessException` (not bare `Exception`) so a real bug still surfaces. ES degrade is a
+      no-op until Phase 12.
+- [x] **Verified live** — empty register body → **422** `problem+json` with `errors`; malformed
+      JSON → **400** `problem+json` (inherited framework handler); GET nonexistent book →
+      **404** `problem+json` with our `type`/`title`/`detail`.
+
+### Remaining (Phase 8)
+Nothing — Phase 8 complete. ✅ Carry-overs (non-blocking): extend the domain-exception 404
+pattern to User/BookCopy/Review/Wishlist for a fully uniform not-found body (or a generic
+`ResourceNotFoundException`); malformed keyset cursor (Phase 3 flag) now renders as a generic
+500-vs-ProblemDetail — could add a targeted handler; a catch-all `@ExceptionHandler(Exception)`
+→ 500 ProblemDetail if we want to guarantee *nothing* leaks a stack trace.
+
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the
   mapper + repo, takes/returns DTOs); Mapper = `@Component` implementing generic
@@ -336,6 +401,11 @@ are Phase 22.
 - ~~`@Transactional` on service write methods → Phase 7~~ — **RESOLVED in Phase 7** on the
   two-entity loan writes (`approve`, `returnLoan`). Single-entity writes still rely on
   `save`/`saveAndFlush`'s own tx.
+- ⚠️ **Auth 401/403 bodies are NOT problem+json yet.** The security `AuthenticationEntryPoint`
+  / `AccessDeniedHandler` write the response *before* the DispatcherServlet, so
+  `GlobalExceptionHandler` never sees them — a rejected request still gets the default Spring
+  `/error` JSON (`{timestamp,status,error,message,path}`), confirmed live. To unify, the entry
+  point/denied handler must write a `ProblemDetail` themselves. Deferred (Phase 17 hardening).
 - 🔴 keyset/cursor pagination query (loans) → Phase 3.
 - ISBN normalization: `@ISBN` accepts hyphens, so the same ISBN in two formats can
   create two rows (UNIQUE doesn't catch it). Normalize-before-save → later.
@@ -350,7 +420,8 @@ Basic CRUD = Phase 2. REST polish (pagination, nested routes, 409, ETags, HATEOA
 v2 shapes) = Phase 3. Validation depth + custom constraints = Phase 4. Auth (JWT,
 refresh rotation, `@PreAuthorize`) = Phase 5. Cross-cutting filters + request context
 (correlation id, request logging, rate limit, `RequestContext`) = Phase 6. Loan state
-transitions + their ownership rules + service `@Transactional` = Phase 7.
+transitions + their ownership rules + service `@Transactional` = Phase 7. RFC 7807 problem
+details + domain exceptions + global advice + Redis fail-open = Phase 8.
 
 ## Working agreement
 Learning project. Claude handles scaffolding/config/boilerplate (incl. pure

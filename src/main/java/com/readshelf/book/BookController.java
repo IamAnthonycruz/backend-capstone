@@ -16,7 +16,6 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import java.net.URI;
 
-import java.util.Optional;
 import java.util.UUID;
 
 
@@ -38,11 +37,8 @@ public class BookController {
     public ResponseEntity<BookResponseDTO> getBook(
             @PathVariable UUID id,
             @RequestHeader(value = HttpHeaders.IF_NONE_MATCH, required = false) String ifNoneMatch) {
-        Optional<BookResponseDTO> found = bookService.findById(id);
-        if (found.isEmpty()) {
-            return ResponseEntity.notFound().build();
-        }
-        BookResponseDTO book = found.get();
+        // Missing book -> BookNotFoundException -> 404 ProblemDetail (handled by the advice).
+        BookResponseDTO book = bookService.getById(id);
 
         // Strong ETag derived from the last-modified version. Changes on every update.
         String etag = "\"" + book.updatedAt().toEpochMilli() + "\"";
@@ -89,9 +85,7 @@ public class BookController {
     @PutMapping("/{id}")
     public ResponseEntity<BookResponseDTO> updateBook(@PathVariable UUID id,
                                                       @Valid @RequestBody BookRequestDTO request) {
-        return bookService.update(id, request)
-                .map(ResponseEntity::ok)
-                .orElseGet(()-> ResponseEntity.notFound().build());
+        return ResponseEntity.ok(bookService.update(id, request));
     }
 
     // TODO(human): only admins may delete any book. Add a method-level @PreAuthorize
@@ -101,9 +95,8 @@ public class BookController {
     @PreAuthorize("hasRole('ADMIN')")
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> deleteBook(@PathVariable UUID id) {
-        if(!bookService.delete(id)) {
-            return ResponseEntity.notFound().build();
-        }
+        // Missing book -> BookNotFoundException -> 404 ProblemDetail (handled by the advice).
+        bookService.delete(id);
         return ResponseEntity.noContent().build();
     }
 }
