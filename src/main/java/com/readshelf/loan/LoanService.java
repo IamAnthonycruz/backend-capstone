@@ -12,6 +12,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Instant;
@@ -35,15 +36,21 @@ public class LoanService {
     private final UserRepository userRepository;
     private final BookCopyRepository bookCopyRepository;
     private final LoanMapper loanMapper;
+    // Programmatic transaction boundary for create(). Spring Boot auto-configures a
+    // TransactionTemplate bean over the JPA transaction manager; we inject it so we can
+    // scope the transaction to only the write, not the reads/guards above it.
+    private final TransactionTemplate transactionTemplate;
 
     public LoanService(LoanRepository loanRepository,
                        UserRepository userRepository,
                        BookCopyRepository bookCopyRepository,
-                       LoanMapper loanMapper) {
+                       LoanMapper loanMapper,
+                       TransactionTemplate transactionTemplate) {
         this.loanRepository = loanRepository;
         this.userRepository = userRepository;
         this.bookCopyRepository = bookCopyRepository;
         this.loanMapper = loanMapper;
+        this.transactionTemplate = transactionTemplate;
     }
 
     public PagedResponse<LoanResponseDTO> findAll(int page, int size, LoanSortField sortBy) {
@@ -108,14 +115,21 @@ public class LoanService {
             throw new LoanLimitExceededException(borrower.getId(), MAX_ACTIVE_LOANS);
         }
 
-        // Map, build, and save the loan
+        // Everything above (FK resolution + the 3 guards) is reads/validation — it runs
+        // OUTSIDE any transaction, so a failed guard throws before a tx is ever opened.
+
+        // Map + build the loan (pure object work, no DB — fine outside the tx).
         Loan loan = loanMapper.toEntity(request);
         loan.setLender(lender);
         loan.setBorrower(borrower);
         loan.setBookCopy(bookCopy);
         loan.setStatus(LoanStatus.REQUESTED); // Every loan starts as a request
 
-        return loanMapper.toResponseDTO(loanRepository.save(loan));
+        // Only the write is transactional. The lambda IS the transaction: commits on
+        // normal return, rolls back on throw. This is the seam where #4's outbox-event
+        // insert will join the same transaction as the loan write.
+        Loan saved = transactionTemplate.execute(status -> loanRepository.save(loan));
+        return loanMapper.toResponseDTO(saved);
     }
 
     /**

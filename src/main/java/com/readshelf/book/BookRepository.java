@@ -43,10 +43,10 @@ public interface BookRepository extends JpaRepository<Book, UUID> {
 
     // v2 book detail: one book's fields + review aggregates, built straight into the DTO.
     @Query("SELECT new com.readshelf.book.BookDetailV2DTO(" +
-            "b.id, b.isbn, b.title, b.author, b.genre, b.summary, " +
+            "b.id, b.isbn, b.title, b.author, b.genre, b.description, " +
             "AVG(r.rating), COUNT(r.id)) " +
             "FROM Book b LEFT JOIN b.reviews r " +
             "WHERE b.id = :id " +
-            "GROUP BY b.id, b.isbn, b.title, b.author, b.genre, b.summary")
+            "GROUP BY b.id, b.isbn, b.title, b.author, b.genre, b.description")
     Optional<BookDetailV2DTO> findBookDetailById(@Param("id") UUID id);
 }

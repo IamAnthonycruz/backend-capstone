@@ -14,7 +14,7 @@ public class BookMapper implements EntityMapper<BookRequestDTO, BookResponseDTO,
         book.setGenre(bookRequestDTO.genre());
         book.setTitle(bookRequestDTO.title());
         book.setAuthor(bookRequestDTO.author());
-        book.setSummary(bookRequestDTO.summary());
+        book.setDescription(bookRequestDTO.summary());
         return book;
     }
 
@@ -26,7 +26,7 @@ public class BookMapper implements EntityMapper<BookRequestDTO, BookResponseDTO,
                 book.getTitle(),
                 book.getAuthor(),
                 book.getGenre(),
-                book.getSummary(),
+                book.getDescription(),
                 book.getUpdatedAt()
         );
     }
