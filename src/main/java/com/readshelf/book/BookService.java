@@ -22,7 +22,7 @@ import java.util.UUID;
  */
 @Service
 public class BookService {
-
+    private static final String DEFAULT_DESCRIPTION = "No description for this book";
     private final BookRepository bookRepository;
     private final BookMapper bookMapper;
 
@@ -44,8 +44,9 @@ public class BookService {
     }
 
     public BookResponseDTO create(BookRequestDTO request) {
-        Book saved = bookRepository.save(bookMapper.toEntity(request));
-        return bookMapper.toResponseDTO(saved);
+        Book book = bookMapper.toEntity(request);
+        book.setDescription(descriptionOrDefault(request.summary()));
+        return bookMapper.toResponseDTO(bookRepository.save(book));
     }
 
     public PagedResponse<BookResponseDTO> findAll(int page, int size, BookSortField sortBy) {
@@ -56,7 +57,7 @@ public class BookService {
     public BookResponseDTO update(UUID id, BookRequestDTO request) {
         Book book = bookRepository.findById(id)
                 .orElseThrow(() -> new BookNotFoundException(id));
-        book.setSummary(request.summary());
+        book.setDescription(descriptionOrDefault(request.summary()));
         book.setIsbn(request.isbn());
         book.setTitle(request.title());
         book.setAuthor(request.author());
@@ -65,6 +66,18 @@ public class BookService {
 
         return bookMapper.toResponseDTO(book);
     }
+
+    /**
+     * The API still allows `summary` to be omitted, but books.description is NOT NULL (V13),
+     * so every write path funnels the incoming value through here first.
+     *
+     * @param requestedSummary the client-supplied summary — may be null
+     * @return a non-null description safe to write to the entity
+     */
+    private String descriptionOrDefault(String requestedSummary) {
+        return requestedSummary == null ? DEFAULT_DESCRIPTION : requestedSummary;
+    }
+
 
     public void delete(UUID id) {
         if (!bookRepository.existsById(id)) {

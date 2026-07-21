@@ -1,6 +1,6 @@
 # ReadShelf — Status
 
-_Last updated: 2026-07-14_
+_Last updated: 2026-07-20_
 
 ## Where we are
 
@@ -51,6 +51,16 @@ HTTP-agnostic domain exceptions (`BookNotFoundException`, `BookAlreadyLentExcept
 framework errors (malformed body, etc.) inherited as ProblemDetail for free. `RateLimitFilter`
 now **fails open** when Redis is unreachable. Old `ValidationExceptionHandler` retired. All
 verified live (422/400/404 all returned `problem+json`). See Phase 8 progress below.
+
+**Phase 9 (Database Transactions & Painful Migrations): COMPLETE.** Expand/contract rename
+of `books.summary` → `books.description` across three migrations (V11 add+backfill, V12 drop
+old column, V13 two-step NOT NULL), decoupled from the public API (request DTO field stays
+`summary`; the service maps it to the renamed column and defaults NULLs so the new NOT NULL
+holds). Programmatic transaction (`TransactionTemplate`) scoping just the write in
+`LoanService.create()`. **Transactional outbox pattern**: an `outbox` table (V14, JSONB
+payload), a `LOAN_REQUESTED` event written in the SAME tx as the loan, and a `@Scheduled`
+`OutboxPoller` that drains + "publishes" (logs; real broker is Phase 11) + stamps
+`processed_at`. All verified live end-to-end. See Phase 9 progress below.
 
 ## Phase 2 progress
 
@@ -388,6 +398,63 @@ pattern to User/BookCopy/Review/Wishlist for a fully uniform not-found body (or 
 500-vs-ProblemDetail — could add a targeted handler; a catch-all `@ExceptionHandler(Exception)`
 → 500 ProblemDetail if we want to guarantee *nothing* leaks a stack trace.
 
+## Phase 9 progress
+
+### Done
+- [x] **Expand/contract rename `summary` → `description`** (zero-downtime, three migrations).
+      **V11** (expand): `ADD COLUMN description` nullable + `UPDATE ... SET description = summary`
+      backfill. **V12** (contract): `DROP COLUMN summary` — gated on "nothing reads the old
+      column" (grep-verified first). **Decision:** the two are split so they can straddle a code
+      deploy — old code (reads `summary`) and new schema must coexist during a rolling deploy, so
+      the drop can't share a migration with the add. Entity/JPQL/mapper updated to
+      `description`; **the public API contract is unchanged** — `BookRequestDTO.summary` stays,
+      and `BookMapper`/`BookService` translate it to the renamed column, so consumers never see
+      the rename.
+- [x] **Two-step NOT NULL on `description`** (**V13**). Step 1 backfills remaining NULLs with a
+      placeholder (`'No description available'`); step 2 `ALTER COLUMN ... SET NOT NULL`.
+      **Order is mandatory:** Postgres validates `SET NOT NULL` immediately via a full scan and
+      rolls back if any NULL survives — so the backfill must precede the constraint. (At scale
+      the production-safe form is `ADD CHECK (... IS NOT NULL) NOT VALID` → `VALIDATE CONSTRAINT`
+      to avoid the long `ACCESS EXCLUSIVE` lock; overkill for this small table, noted in the SQL.)
+- [x] **App-layer default for the new NOT NULL** — `BookService.descriptionOrDefault(...)`
+      funnels both write paths (`create`/`update`); a null incoming `summary` becomes
+      `DEFAULT_DESCRIPTION`. **Decision:** default in the *service*, not a DB column DEFAULT —
+      Hibernate always lists mapped columns in its INSERT (an explicit NULL bypasses a column
+      DEFAULT), so a DB default wouldn't reliably fire for an ORM-managed field. Mapper stays
+      "dumb". Known tradeoff: an empty string `""` still passes through (guard is null-only).
+- [x] **Programmatic transaction (`TransactionTemplate`) in `LoanService.create()`** — the FK
+      resolution + 3 guards run OUTSIDE any tx (a failed guard throws before a tx opens); only
+      the write runs inside `transactionTemplate.execute(...)`. **Decision:** programmatic (not
+      `@Transactional`) to scope the tx to just the write and to own the exact block the outbox
+      insert joins. Reviewed `approve()`/`returnLoan()`'s declarative `@Transactional` as correct
+      (two-entity atomic writes + open persistence context for dirty-check flush).
+- [x] **Transactional outbox — write side.** `outbox` table (**V14**): `id`, `event_type`,
+      `payload JSONB`, `created_at` (ordering + queued-at), `processed_at` (nullable timestamp =
+      publish marker; NULL = pending — chosen over a boolean to keep publish latency for free).
+      `outbox.OutboxEvent` entity (`@JdbcTypeCode(SqlTypes.JSON)` binds the `String` payload to
+      `jsonb`). In `create()`, inside the SAME `execute(...)` tx as the loan save: build a
+      `{loanId, lenderId, borrowerId}` payload, serialize with the injected `ObjectMapper`, and
+      `outboxRepository.save(...)` a `LOAN_REQUESTED` event → loan + event commit atomically,
+      killing the dual-write problem.
+- [x] **Transactional outbox — read side.** `@EnableScheduling` on the app; `outbox.OutboxPoller`
+      `@Scheduled(fixedDelay = 5000)` drains `findByProcessedAtIsNullOrderByCreatedAtAsc()`
+      (oldest first), "publishes" each (`log.info` for now — real RabbitMQ is Phase 11), then sets
+      `processedAt = now()` and `save`s. The stamp is what drops the row from the next tick's
+      query (no `processed_at` → infinite re-publish). Explicit `save()` needed: the method isn't
+      `@Transactional`, so the fetched entities are detached and a bare setter wouldn't flush.
+- [x] **Verified live end-to-end** — registered a borrower → JWT → `POST /loans` (**201**,
+      REQUESTED). One `outbox` row written with `created_at` **7 ms** after the loan's
+      `requestDate` (same tx); poller logged `Publishing outbox event LOAN_REQUESTED: {...}` and
+      stamped `processed_at` to the same millisecond; event published **exactly once**, **0**
+      unprocessed rows remaining (stamp correctly prevents re-publish).
+
+### Remaining (Phase 9)
+Nothing — Phase 9 complete. ✅ Carry-overs (non-blocking): the poller's "publish" is a log
+placeholder until **Phase 11** wires the real RabbitMQ send (and at-least-once delivery means
+consumers must be idempotent — the same event can re-publish if a publish succeeds but the stamp
+fails); a partial `WHERE processed_at IS NULL` index on `outbox` would help once the table grows;
+`FOR UPDATE SKIP LOCKED` on the drain query is the multi-instance-safe upgrade.
+
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the
   mapper + repo, takes/returns DTOs); Mapper = `@Component` implementing generic
@@ -411,6 +478,11 @@ pattern to User/BookCopy/Review/Wishlist for a fully uniform not-found body (or 
   create two rows (UNIQUE doesn't catch it). Normalize-before-save → later.
 - Naming nit: `utils.ObjectMapper` collides conceptually with Jackson's `ObjectMapper`
   (suggested rename to `EntityMapper`, not yet done).
+- ⚠️ **Jackson 3 on Spring Boot 4:** the auto-configured bean is `tools.jackson.databind.
+  ObjectMapper` (databind/core moved to the `tools.jackson` package); the Jackson-2
+  `com.fasterxml.jackson.databind.ObjectMapper` has no bean and won't autowire. Annotations
+  stayed at `com.fasterxml.jackson.annotation.*`. Jackson 3 exceptions are **unchecked**
+  (`JacksonException extends RuntimeException`) — no `try/catch` forced on `writeValueAsString`.
 - Rate limiter (Phase 6): not atomic (3 round-trips) → Lua script later; `getRemoteAddr()`
   is the proxy IP behind a LB → `X-Forwarded-For` later; limits are constants → could be
   `@ConfigurationProperties`. Full structured-JSON logging (`logback-spring.xml`) → Phase 18.
@@ -421,7 +493,10 @@ v2 shapes) = Phase 3. Validation depth + custom constraints = Phase 4. Auth (JWT
 refresh rotation, `@PreAuthorize`) = Phase 5. Cross-cutting filters + request context
 (correlation id, request logging, rate limit, `RequestContext`) = Phase 6. Loan state
 transitions + their ownership rules + service `@Transactional` = Phase 7. RFC 7807 problem
-details + domain exceptions + global advice + Redis fail-open = Phase 8.
+details + domain exceptions + global advice + Redis fail-open = Phase 8. DB transactions
+(programmatic `TransactionTemplate` + transactional outbox) + painful migrations
+(expand/contract rename, two-step NOT NULL) = Phase 9. Real broker publish of outbox
+events = Phase 11.
 
 ## Working agreement
 Learning project. Claude handles scaffolding/config/boilerplate (incl. pure

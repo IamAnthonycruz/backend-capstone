@@ -36,8 +36,8 @@ public class Book {
     @Column(name = "genre")
     private String genre;
 
-    @Column(name = "summary", length = 200)
-    private String summary;
+    @Column(name = "description", nullable = false, length = 200)
+    private String description;
 
     @CreationTimestamp
     @Column(name = "created_at", nullable = false)
