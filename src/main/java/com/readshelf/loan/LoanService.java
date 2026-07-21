@@ -2,6 +2,8 @@ package com.readshelf.loan;
 
 import com.readshelf.book.BookCopy;
 import com.readshelf.book.BookCopyRepository;
+import com.readshelf.outbox.OutboxEvent;
+import com.readshelf.outbox.OutboxRepository;
 import com.readshelf.user.User;
 import com.readshelf.user.UserRepository;
 import com.readshelf.utils.CursorPage;
@@ -14,6 +16,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
+import tools.jackson.databind.ObjectMapper;
 
 import java.time.Instant;
 import java.util.*;
@@ -40,17 +43,25 @@ public class LoanService {
     // TransactionTemplate bean over the JPA transaction manager; we inject it so we can
     // scope the transaction to only the write, not the reads/guards above it.
     private final TransactionTemplate transactionTemplate;
+    // Outbox collaborators: the repo persists the event row, the mapper serializes the
+    // payload to a JSON string. Both used inside create()'s transaction.
+    private final OutboxRepository outboxRepository;
+    private final ObjectMapper objectMapper;
 
     public LoanService(LoanRepository loanRepository,
                        UserRepository userRepository,
                        BookCopyRepository bookCopyRepository,
                        LoanMapper loanMapper,
-                       TransactionTemplate transactionTemplate) {
+                       TransactionTemplate transactionTemplate,
+                       OutboxRepository outboxRepository,
+                       ObjectMapper objectMapper) {
         this.loanRepository = loanRepository;
         this.userRepository = userRepository;
         this.bookCopyRepository = bookCopyRepository;
         this.loanMapper = loanMapper;
         this.transactionTemplate = transactionTemplate;
+        this.outboxRepository = outboxRepository;
+        this.objectMapper = objectMapper;
     }
 
     public PagedResponse<LoanResponseDTO> findAll(int page, int size, LoanSortField sortBy) {
@@ -126,9 +137,28 @@ public class LoanService {
         loan.setStatus(LoanStatus.REQUESTED); // Every loan starts as a request
 
         // Only the write is transactional. The lambda IS the transaction: commits on
-        // normal return, rolls back on throw. This is the seam where #4's outbox-event
-        // insert will join the same transaction as the loan write.
-        Loan saved = transactionTemplate.execute(status -> loanRepository.save(loan));
+        // normal return, rolls back on throw. Both the loan AND its outbox event are
+        // saved here, so they commit atomically — the whole point of the pattern.
+        Loan saved = transactionTemplate.execute(status -> {
+            Loan persisted = loanRepository.save(loan);
+            // Using Java Map (Quickest)
+            Map<String, Object> payloadMap = Map.of(
+                    "loanId", persisted.getId(),
+                    "lenderId", persisted.getLender().getId(),  // Adjust getter name to match your entity
+                    "borrowerId", persisted.getBorrower().getId() // Adjust getter name to match your entity
+            );
+
+            var payloadJson = objectMapper.writeValueAsString(payloadMap);
+
+            OutboxEvent outboxEvent = new OutboxEvent();
+            outboxEvent.setEventType("LOAN_REQUESTED");
+            outboxEvent.setPayload(payloadJson);
+
+            outboxRepository.save(outboxEvent);
+
+
+            return persisted;
+        });
         return loanMapper.toResponseDTO(saved);
     }
 
