@@ -1,6 +1,7 @@
 package com.readshelf.system;
 
 import com.readshelf.book.BookNotFoundException;
+import com.readshelf.user.UserProfileNotFoundException;
 import com.readshelf.loan.BookAlreadyLentException;
 import com.readshelf.loan.LoanLimitExceededException;
 import com.readshelf.loan.UnauthorizedLoanActionException;
@@ -54,6 +55,14 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
         problemDetail.setTitle("Book Not Found");
         problemDetail.setType(URI.create("/problems/book-not-found"));
+        return problemDetail;
+    }
+
+    @ExceptionHandler(UserProfileNotFoundException.class)
+    public ProblemDetail handleUserProfileNotFoundException(UserProfileNotFoundException e) {
+        ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
+        problemDetail.setTitle("Profile Not Found");
+        problemDetail.setType(URI.create("/problems/profile-not-found"));
         return problemDetail;
     }
 

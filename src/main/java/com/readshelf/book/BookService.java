@@ -1,6 +1,9 @@
 package com.readshelf.book;
 
+import com.readshelf.config.CacheConfig;
 import com.readshelf.utils.PagedResponse;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -31,6 +34,7 @@ public class BookService {
         this.bookMapper = bookMapper;
     }
 
+    @Cacheable(value = CacheConfig.BOOKS, key = "#id")
     public BookResponseDTO getById(UUID id) {
         return bookRepository.findById(id)
                 .map(bookMapper::toResponseDTO)
@@ -54,6 +58,7 @@ public class BookService {
         return PagedResponse.from(bookRepository.findAll(pageable).map(bookMapper::toResponseDTO));
     }
 
+    @CacheEvict(value = CacheConfig.BOOKS, key = "#id")
     public BookResponseDTO update(UUID id, BookRequestDTO request) {
         Book book = bookRepository.findById(id)
                 .orElseThrow(() -> new BookNotFoundException(id));
@@ -79,6 +84,7 @@ public class BookService {
     }
 
 
+    @CacheEvict(value = CacheConfig.BOOKS, key = "#id")
     public void delete(UUID id) {
         if (!bookRepository.existsById(id)) {
             throw new BookNotFoundException(id);

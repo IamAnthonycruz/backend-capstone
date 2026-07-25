@@ -188,6 +188,11 @@ public class LoanService {
         loan.setStatus(LoanStatus.APPROVED);
         loan.setApprovalDate(Instant.now());
         loan.getBookCopy().setAvailable(false);
+        // NOTE (Phase 10 caching): the README calls for a @CacheEvict here because approval
+        // flips BookCopy.is_available. We intentionally omit it — in Model A (catalog/copy
+        // split) availability lives on BookCopy, which we don't cache, and the cached `books`
+        // region (BookResponseDTO) carries no availability field. There is nothing stale to
+        // evict. If a future cached read ever reflects copy availability, add the evict then.
         return loanMapper.toResponseDTO(loanRepository.save(loan));
     }
 

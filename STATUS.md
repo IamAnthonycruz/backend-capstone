@@ -1,6 +1,6 @@
 # ReadShelf — Status
 
-_Last updated: 2026-07-20_
+_Last updated: 2026-07-24_
 
 ## Where we are
 
@@ -61,6 +61,15 @@ holds). Programmatic transaction (`TransactionTemplate`) scoping just the write 
 payload), a `LOAN_REQUESTED` event written in the SAME tx as the loan, and a `@Scheduled`
 `OutboxPoller` that drains + "publishes" (logs; real broker is Phase 11) + stamps
 `processed_at`. All verified live end-to-end. See Phase 9 progress below.
+
+**Phase 10 (Caching): COMPLETE.** Redis-backed Spring Cache. `@Cacheable` on `GET books/{id}`
+and `GET users/{id}/profile` (cache-aside read); `@CacheEvict` on book update/delete and profile
+upsert; loan-approval evict is a documented no-op (availability lives on the uncached `BookCopy`,
+not the cached `books` region). Per-region TTLs (books 10m, userProfiles 30m) + a type-bound JSON
+value serializer per region. **Fail-open**: a `CacheErrorHandler` logs + swallows cache errors so
+a Redis outage degrades to the DB instead of 500ing — bounded by a **60ms Redis command/connect
+timeout** so a dead Redis fails fast (0.19s) instead of blocking ~60s. All verified live
+end-to-end. See Phase 10 progress below.
 
 ## Phase 2 progress
 
@@ -455,6 +464,53 @@ consumers must be idempotent — the same event can re-publish if a publish succ
 fails); a partial `WHERE processed_at IS NULL` index on `outbox` would help once the table grows;
 `FOR UPDATE SKIP LOCKED` on the drain query is the multi-instance-safe upgrade.
 
+## Phase 10 progress
+
+### Done
+- [x] **Cache-aside reads** — `@Cacheable` on `BookService.getById` (region `books`, key `#id`)
+      and `UserProfileService.getByUserId` (region `userProfiles`, key `#userId`). Annotations
+      live on the **service** (a Spring proxy), never the controller, and never on a method the
+      same class self-invokes (self-invocation bypasses the proxy). Verified live: 1st GET = 2 DB
+      queries (miss → DB → populate), 2nd GET = 0 queries (Redis hit); key visible in `redis-cli`.
+- [x] **Evict on write** — `@CacheEvict(key = "#id")` on `BookService.update` + `delete`;
+      `@CacheEvict(value = userProfiles, key = "#userId")` on `UserProfileService.upsert`.
+      **Decision:** evict, not `@CachePut` — CachePut only stays correct while the write's return
+      value is byte-identical to what a read caches; it silently serves divergent data until TTL if
+      that ever drifts, whereas evict self-heals on the next read. Verified: PUT wiped the key, next
+      GET re-queried and returned the new title.
+- [x] **Loan-approval evict = documented no-op** — README asks for an evict on approval (it flips
+      `BookCopy.is_available`), but in **Model A** availability lives on `BookCopy` (uncached) and
+      the cached `books` region (`BookResponseDTO`) carries no availability field. Nothing stale to
+      evict; a comment in `LoanService.approve` says to add one if a cached read ever reflects copy
+      availability.
+- [x] **Per-region TTL + type-bound serialization** (`config.CacheConfig`, `@EnableCaching`).
+      `RedisCacheManagerBuilderCustomizer` sets books=10m, userProfiles=30m (default 10m). **Each
+      region caches exactly one type**, so each uses a `JacksonJsonRedisSerializer` bound to that
+      concrete class (`BookResponseDTO` / `UserProfileResponseDTO`) — reads plain JSON straight back
+      into the record, no `@class` hint. The generic `GenericJacksonJsonRedisSerializer` survives
+      only as the default fallback (default typing on, validator restricted to `com.readshelf.` /
+      `java.util.` / `java.time.`). String keys so they're greppable. **Boot 4 note:**
+      `RedisCacheManagerBuilderCustomizer` moved to `org.springframework.boot.cache.autoconfigure`.
+- [x] **Fail-open** (`config.CacheErrorConfig implements CachingConfigurer`) — overrides the
+      default `SimpleCacheErrorHandler` (which rethrows → 500) with one that logs a warning and
+      swallows GET/PUT/EVICT/CLEAR errors, so a cache op failure falls through to the method body
+      (DB). **Decision:** a caching layer must never block reads *or* writes; evict-failure staleness
+      is bounded by the region TTL. Same philosophy as Phase 8's rate-limiter fail-open.
+- [x] **Bounded timeout is what makes fail-open fast** — the error handler only fires once a cache
+      op *throws*; without a timeout Lettuce **blocks** ~33–60s (its default command timeout) before
+      throwing. Set `spring.data.redis.timeout` + `connect-timeout` = **60ms** so a dead Redis fails
+      fast. Verified live (Redis stopped, staying down): GET returned **200 in 0.19s** (was 33s),
+      `Cache GET failed (serving from DB) … Redis command timed out` warning fired, 2 DB queries
+      served the response. **Tradeoff (known):** 60ms is a *global* command timeout, so under real
+      load/GC a healthy Redis could occasionally exceed it and get treated as down — a prod value
+      typically sits higher (100–250ms); 60ms is tuned for localhost.
+
+### Remaining (Phase 10)
+Nothing — Phase 10 complete. ✅ Carry-overs (non-blocking): a 60ms global command timeout can
+false-positive under load (raise for prod, or use a circuit breaker so a known-down Redis is
+skipped entirely instead of paying the timeout on every request); caching is read-through only on
+two hot GETs — widen if other reads get hot; no cache warming / no metrics on hit-rate yet.
+
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the
   mapper + repo, takes/returns DTOs); Mapper = `@Component` implementing generic
@@ -495,8 +551,9 @@ refresh rotation, `@PreAuthorize`) = Phase 5. Cross-cutting filters + request co
 transitions + their ownership rules + service `@Transactional` = Phase 7. RFC 7807 problem
 details + domain exceptions + global advice + Redis fail-open = Phase 8. DB transactions
 (programmatic `TransactionTemplate` + transactional outbox) + painful migrations
-(expand/contract rename, two-step NOT NULL) = Phase 9. Real broker publish of outbox
-events = Phase 11.
+(expand/contract rename, two-step NOT NULL) = Phase 9. Redis-backed caching (cache-aside
+`@Cacheable`/`@CacheEvict`, per-region TTL, fail-open + bounded timeout) = Phase 10. Real broker
+publish of outbox events = Phase 11.
 
 ## Working agreement
 Learning project. Claude handles scaffolding/config/boilerplate (incl. pure

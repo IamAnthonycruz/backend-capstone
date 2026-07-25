@@ -40,6 +40,10 @@ spring:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:}
+      # Bounds how long a cache call blocks before it throws and fail-open kicks in.
+      # timeout = per-command wait; connect-timeout = initial socket connect.
+      timeout: 60ms
+      connect-timeout: 60ms
   cache:
     type: redis
 
