@@ -7,6 +7,7 @@ import org.springframework.data.repository.query.Param;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 public interface LoanRepository extends JpaRepository<Loan, UUID> {
@@ -47,4 +48,24 @@ public interface LoanRepository extends JpaRepository<Loan, UUID> {
             "LIMIT :limit",
             nativeQuery = true)
     List<Loan> findFirstPage(@Param("limit") int limit);
+
+    // Notification lookup for the AMQP listeners. Projects the columns an email actually needs
+    // instead of loading the Loan entity, which would pull in lender + borrower and then one
+    // eager UserProfile per user — three queries for a handful of strings.
+    //
+    // Plain JOIN, not JOIN FETCH: a constructor expression has no entity to hang a fetched
+    // association off, so FETCH is illegal here. Inner JOIN is safe only because lender_id and
+    // borrower_id are NOT NULL — if either were nullable, a real loan would return zero rows
+    // and the consumer would misread that as "deleted" and permanently reject the message.
+    @Query("""
+            SELECT new com.readshelf.loan.LoanNotificationView(
+                       lu.email, lu.username, bu.email, bu.username)
+            FROM Loan l
+            JOIN l.lender lu
+            JOIN l.borrower bu
+            WHERE l.id = :id
+            """)
+    Optional<LoanNotificationView> findNotificationView(@Param("id") UUID id);
+
+    List<Loan> findByStatusAndDueDateBefore(LoanStatus status, Instant cutoff);
 }

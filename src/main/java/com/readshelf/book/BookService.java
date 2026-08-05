@@ -1,6 +1,10 @@
 package com.readshelf.book;
 
 import com.readshelf.config.CacheConfig;
+import com.readshelf.event.BookCreatedEvent;
+import com.readshelf.event.BookUpdatedEvent;
+import com.readshelf.outbox.OutboxEvent;
+import com.readshelf.outbox.OutboxRepository;
 import com.readshelf.utils.PagedResponse;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
@@ -9,9 +13,9 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.databind.ObjectMapper;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -20,18 +24,31 @@ import java.util.UUID;
  *
  * Convention: service methods take/return DTOs (they own the BookMapper + repository).
  *
- * Note for later: write methods (create/update/delete) are where @Transactional will go
- * in Phase 7 — leaving it off for now to avoid pre-building concurrency concerns.
+ * Phase 11: create/update now open a transaction, because each pairs its entity write with an
+ * outbox row and the two must commit together. Both use TransactionTemplate inside the method
+ * rather than an annotation — see update() for why that matters next to the cache eviction.
  */
 @Service
 public class BookService {
     private static final String DEFAULT_DESCRIPTION = "No description for this book";
     private final BookRepository bookRepository;
     private final BookMapper bookMapper;
+    // Outbox collaborators, same shape as LoanService: the template scopes the transaction to the
+    // write, the repo persists the event row, the mapper serializes the payload.
+    private final TransactionTemplate transactionTemplate;
+    private final OutboxRepository outboxRepository;
+    private final ObjectMapper objectMapper;
 
-    public BookService(BookRepository bookRepository, BookMapper bookMapper) {
+    public BookService(BookRepository bookRepository,
+                       BookMapper bookMapper,
+                       TransactionTemplate transactionTemplate,
+                       OutboxRepository outboxRepository,
+                       ObjectMapper objectMapper) {
         this.bookRepository = bookRepository;
         this.bookMapper = bookMapper;
+        this.transactionTemplate = transactionTemplate;
+        this.outboxRepository = outboxRepository;
+        this.objectMapper = objectMapper;
     }
 
     @Cacheable(value = CacheConfig.BOOKS, key = "#id")
@@ -50,7 +67,17 @@ public class BookService {
     public BookResponseDTO create(BookRequestDTO request) {
         Book book = bookMapper.toEntity(request);
         book.setDescription(descriptionOrDefault(request.summary()));
-        return bookMapper.toResponseDTO(bookRepository.save(book));
+
+        // Book + outbox row in ONE transaction. Without this they'd be two separate commits
+        // (save() supplies its own), so a crash between them loses the event with the book
+        // already persisted — the dual-write problem the outbox exists to remove.
+        Book saved = transactionTemplate.execute(status -> {
+            Book persisted = bookRepository.save(book);
+            publishOutbox("BOOK_CREATED", "book.created", new BookCreatedEvent(persisted.getId()));
+            return persisted;
+        });
+
+        return bookMapper.toResponseDTO(saved);
     }
 
     public PagedResponse<BookResponseDTO> findAll(int page, int size, BookSortField sortBy) {
@@ -58,6 +85,18 @@ public class BookService {
         return PagedResponse.from(bookRepository.findAll(pageable).map(bookMapper::toResponseDTO));
     }
 
+    /**
+     * The transaction is a TransactionTemplate INSIDE the method rather than an annotation on it,
+     * and that is deliberate, because {@code @CacheEvict} is on this method too.
+     *
+     * {@code @CacheEvict} defaults to beforeInvocation=false, so it fires after the method returns.
+     * Both annotations are advice on the same proxy call and Spring doesn't guarantee their
+     * relative order, so with {@code @Transactional} the evict can run BEFORE the commit. In that window a
+     * concurrent getById() misses the cache, reads the still-uncommitted (old) row, and repopulates
+     * the cache with stale data — which then survives until the region TTL, because the eviction
+     * already happened and nothing will fire another. Committing inside the body makes the ordering
+     * explicit: new data is visible before the evict runs.
+     */
     @CacheEvict(value = CacheConfig.BOOKS, key = "#id")
     public BookResponseDTO update(UUID id, BookRequestDTO request) {
         Book book = bookRepository.findById(id)
@@ -67,9 +106,25 @@ public class BookService {
         book.setTitle(request.title());
         book.setAuthor(request.author());
         book.setGenre(request.genre());
-        bookRepository.save(book);
+
+        transactionTemplate.executeWithoutResult(status -> {
+            bookRepository.save(book);
+            publishOutbox("BOOK_UPDATED", "book.updated", new BookUpdatedEvent(book.getId()));
+        });
 
         return bookMapper.toResponseDTO(book);
+    }
+
+    /**
+     * Writes an outbox row. Must be called from inside a transaction that also contains the
+     * business write — on its own it gives you nothing the pattern is for.
+     */
+    private void publishOutbox(String eventType, String routingKey, Object payload) {
+        OutboxEvent outboxEvent = new OutboxEvent();
+        outboxEvent.setEventType(eventType);
+        outboxEvent.setRoutingKey(routingKey);
+        outboxEvent.setPayload(objectMapper.writeValueAsString(payload));
+        outboxRepository.save(outboxEvent);
     }
 
     /**

@@ -38,6 +38,13 @@ public class OutboxEvent {
     @Column(name = "event_type", nullable = false)
     private String eventType;
 
+    // The AMQP routing key this event publishes under (e.g. "loan.requested"). Stored rather
+    // than derived from eventType at publish time: the producer owns the routing decision and
+    // writes it in the same transaction as the business change. A key no binding matches is
+    // dropped silently by the broker, so this is not a value to reconstruct by string-munging.
+    @Column(name = "routing_key", nullable = false)
+    private String routingKey;
+
     // The serialized event body. @JdbcTypeCode(JSON) binds this String to the jsonb
     // column instead of a plain varchar.
     @JdbcTypeCode(SqlTypes.JSON)
