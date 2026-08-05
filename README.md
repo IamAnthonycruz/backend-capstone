@@ -172,17 +172,25 @@ Difficulty rises with joins, aggregation, and pagination:
 ### Phase 11: Async & Messaging (Topics 15, 16)
 **Goal:** Background job processing and scheduled tasks.
 
-- [ ] RabbitMQ container in `docker-compose.yml`
-- [ ] Event publishing: `LoanRequestedEvent`, `LoanApprovedEvent`, `LoanOverdueEvent`,
+- [x] RabbitMQ container in `docker-compose.yml`
+- [x] Event publishing: `LoanRequestedEvent`, `LoanApprovedEvent`, `LoanOverdueEvent`,
       `BookCreatedEvent`, `BookUpdatedEvent`
-- [ ] Outbox poller: reads `outbox` table, publishes to RabbitMQ, marks as sent
-- [ ] Consumers:
+- [x] Outbox poller: reads `outbox` table, publishes to RabbitMQ, marks as sent
+- [x] Consumers:
   - `EmailNotificationConsumer` — sends transactional emails (JavaMailSender + MailHog)
-  - `SearchIndexConsumer` — syncs book data to Elasticsearch
-  - `WebhookDispatchConsumer` — fires outbound webhooks
-- [ ] `@Scheduled` overdue loan checker: runs nightly, publishes `LoanOverdueEvent`
-- [ ] `@Scheduled` stale outbox cleanup: deletes successfully-sent outbox entries older than 7 days
-- [ ] `@Async` thread pool configuration and sizing
+  - ~~`SearchIndexConsumer` — syncs book data to Elasticsearch~~ → **moved to Phase 12**, which owns
+    the index mapping and query side. Its queue/binding is declared there too.
+  - ~~`WebhookDispatchConsumer` — fires outbound webhooks~~ → **moved to Phase 16**, which owns
+    `webhook_subscriptions`, HMAC signing, retry backoff, and delivery records. Nothing to deliver
+    to before then.
+- [x] `@Scheduled` overdue loan checker: runs nightly, publishes `LoanOverdueEvent`
+- [x] `@Scheduled` stale outbox cleanup: deletes successfully-sent outbox entries older than 7 days
+- [x] Scheduler pool sizing (`spring.task.scheduling.pool.size`) so independent `@Scheduled` jobs
+      don't serialize on one thread
+- [ ] ~~`@Async` thread pool configuration and sizing~~ → **Phase 21**, where it's already listed
+      alongside the load test that makes the numbers defensible. Phase 11 uses no `@Async` at all:
+      the broker *is* the async mechanism, and unlike a local thread pool it survives a restart.
+      Listener concurrency (`spring.rabbitmq.listener.simple.concurrency`) goes there too.
 
 ### Phase 12: Search (Topic 17)
 **Goal:** Full-text search across the catalog.
@@ -192,7 +200,13 @@ Difficulty rises with joins, aggregation, and pagination:
 - [ ] Review content indexed and searchable
 - [ ] `GET /api/v1/search/books?q=dostoevsky` with fuzzy matching
 - [ ] Relevance scoring and result highlighting
-- [ ] Index kept in sync via RabbitMQ consumer (from Phase 11)
+- [ ] `SearchIndexConsumer` (moved here from Phase 11) — declares `readshelf.search.queue` bound to
+      `book.#` on the existing `readshelf.events` exchange, and keeps the index in sync. No producer
+      changes needed; the `book.created` / `book.updated` events are already being published.
+- [ ] `BookDeletedEvent` + `BookService.delete` publishing it (moved here from Phase 11) — the one
+      producer Phase 11 left out, because removing a document from the index is the only thing that
+      would consume it and that index doesn't exist until this phase. Needs an `EVENT_TYPE_MAPPING`
+      entry too. Until it lands, a deleted book stays searchable.
 - [ ] Graceful degradation: ES down → return empty results + warning, don't crash
 
 ### Phase 13: Object Storage (Topic 25)
@@ -234,7 +248,8 @@ Difficulty rises with joins, aggregation, and pagination:
 - [ ] `webhook_deliveries` table: subscription_id, payload, status, attempts, last_attempt_at
 - [ ] HMAC-SHA256 signature on payloads using the subscription secret
 - [ ] Retry with exponential backoff (1m, 5m, 30m, 2h — max 5 attempts)
-- [ ] `WebhookDispatchConsumer` reads from RabbitMQ, delivers, records result
+- [ ] `WebhookDispatchConsumer` (moved here from Phase 11) — declares `readshelf.webhook.queue`
+      bound to `#` on the existing `readshelf.events` exchange, delivers, records result
 - [ ] `GET /api/v1/webhooks/{id}/deliveries` — users can inspect delivery history
 
 ### Phase 17: Security Hardening (Topic 22)
@@ -287,7 +302,10 @@ Difficulty rises with joins, aggregation, and pagination:
 
 - [ ] Load test: 10 users simultaneously borrow the same book → only 1 succeeds
 - [ ] Optimistic lock retry strategy (catch `OptimisticLockingFailureException`, retry once)
-- [ ] `@Async` thread pool: configure `corePoolSize`, `maxPoolSize`, `queueCapacity`
+- [ ] `@Async` thread pool: configure `corePoolSize`, `maxPoolSize`, `queueCapacity` (moved here
+      from Phase 11 — sizing needs the load test above to be defensible rather than invented)
+- [ ] RabbitMQ listener concurrency (`spring.rabbitmq.listener.simple.concurrency` /
+      `max-concurrency`) — how many threads drain a queue; also needs load to size
 - [ ] Demonstrate thread pool exhaustion and recovery
 - [ ] Document: what is thread-safe in Spring (singletons) and what isn't
 

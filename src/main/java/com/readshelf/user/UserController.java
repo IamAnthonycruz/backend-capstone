@@ -17,9 +17,11 @@ import java.util.UUID;
 public class UserController {
 
     private final UserService userService;
+    private final UserProfileService userProfileService;
 
-    public UserController(UserService userService) {
+    public UserController(UserService userService, UserProfileService userProfileService) {
         this.userService = userService;
+        this.userProfileService = userProfileService;
     }
 
     @GetMapping
@@ -58,6 +60,22 @@ public class UserController {
         return userService.update(id, request)
                 .map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    // --- Nested profile resource (Phase 10 caching target) ---
+    // Rooted under the parent (/users/{id}/profile), so UserController owns it — same
+    // convention as /books/{id}/reviews. The service does the cache-aside read.
+    @GetMapping("/{id}/profile")
+    public ResponseEntity<UserProfileResponseDTO> getProfile(@PathVariable UUID id) {
+        return ResponseEntity.ok(userProfileService.getByUserId(id));
+    }
+
+    // Upsert: create the profile if absent, update if present. Owner-only (same rule as PUT user).
+    @PreAuthorize("authentication.principal == #id.toString()")
+    @PutMapping("/{id}/profile")
+    public ResponseEntity<UserProfileResponseDTO> updateProfile(@PathVariable UUID id,
+                                                                @Valid @RequestBody UserProfileRequestDTO request) {
+        return ResponseEntity.ok(userProfileService.upsert(id, request));
     }
 
     @DeleteMapping("/{id}")

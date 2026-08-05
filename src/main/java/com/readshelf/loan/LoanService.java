@@ -2,6 +2,8 @@ package com.readshelf.loan;
 
 import com.readshelf.book.BookCopy;
 import com.readshelf.book.BookCopyRepository;
+import com.readshelf.event.LoanApprovedEvent;
+import com.readshelf.event.LoanRequestedEvent;
 import com.readshelf.outbox.OutboxEvent;
 import com.readshelf.outbox.OutboxRepository;
 import com.readshelf.user.User;
@@ -35,6 +37,10 @@ import java.util.stream.Collectors;
 @Service
 public class LoanService {
     private static final int MAX_ACTIVE_LOANS = 3;
+    // States a loan can be returned FROM. EnumSet so iteration (and therefore the 409 message)
+    // follows lifecycle order rather than insertion order.
+    private static final Set<LoanStatus> RETURNABLE_STATES =
+            EnumSet.of(LoanStatus.ACTIVE, LoanStatus.OVERDUE);
     private final LoanRepository loanRepository;
     private final UserRepository userRepository;
     private final BookCopyRepository bookCopyRepository;
@@ -141,17 +147,21 @@ public class LoanService {
         // saved here, so they commit atomically — the whole point of the pattern.
         Loan saved = transactionTemplate.execute(status -> {
             Loan persisted = loanRepository.save(loan);
-            // Using Java Map (Quickest)
-            Map<String, Object> payloadMap = Map.of(
-                    "loanId", persisted.getId(),
-                    "lenderId", persisted.getLender().getId(),  // Adjust getter name to match your entity
-                    "borrowerId", persisted.getBorrower().getId() // Adjust getter name to match your entity
-            );
-
-            var payloadJson = objectMapper.writeValueAsString(payloadMap);
+            // Serialize the actual event record rather than a hand-built Map: with a Map, adding a
+            // field to LoanRequestedEvent leaves this untouched and the consumer silently receives
+            // null for it. With the record, that same change is a compile error here.
+            var payloadJson = objectMapper.writeValueAsString(new LoanRequestedEvent(
+                    persisted.getId(),
+                    persisted.getLender().getId(),
+                    persisted.getBorrower().getId()));
 
             OutboxEvent outboxEvent = new OutboxEvent();
             outboxEvent.setEventType("LOAN_REQUESTED");
+            // The producer decides the destination, in the same tx as the business write.
+            // Concrete key (no wildcards — those belong to bindings): "loan.#" in RabbitConfig
+            // matches this, and the ".requested" half lets the email consumer tell a borrow
+            // request apart from an overdue notice without opening the payload.
+            outboxEvent.setRoutingKey("loan.requested");
             outboxEvent.setPayload(payloadJson);
 
             outboxRepository.save(outboxEvent);
@@ -188,6 +198,24 @@ public class LoanService {
         loan.setStatus(LoanStatus.APPROVED);
         loan.setApprovalDate(Instant.now());
         loan.getBookCopy().setAvailable(false);
+
+        // No TransactionTemplate here: this method is already @Transactional, so the outbox row
+        // joins the SAME transaction as the status change and the copy flip. All three commit or
+        // none do — which is the entire guarantee the outbox pattern buys.
+        OutboxEvent outboxEvent = new OutboxEvent();
+        outboxEvent.setEventType("LOAN_APPROVED");
+        outboxEvent.setRoutingKey("loan.approved");
+        outboxEvent.setPayload(objectMapper.writeValueAsString(new LoanApprovedEvent(
+                loan.getId(),
+                loan.getLender().getId(),
+                loan.getBorrower().getId(),
+                loan.getApprovalDate())));
+        outboxRepository.save(outboxEvent);
+        // NOTE (Phase 10 caching): the README calls for a @CacheEvict here because approval
+        // flips BookCopy.is_available. We intentionally omit it — in Model A (catalog/copy
+        // split) availability lives on BookCopy, which we don't cache, and the cached `books`
+        // region (BookResponseDTO) carries no availability field. There is nothing stale to
+        // evict. If a future cached read ever reflects copy availability, add the evict then.
         return loanMapper.toResponseDTO(loanRepository.save(loan));
     }
 
@@ -224,8 +252,14 @@ public class LoanService {
         if  (!callerId.equals(loan.getBorrower().getId())) {
             throw new UnauthorizedLoanActionException(loanId, "return");
         }
-        if (loan.getStatus() != LoanStatus.ACTIVE){
-            throw new IllegalLoanStateException(loanId, loan.getStatus(), LoanStatus.ACTIVE);
+        // Widened in Phase 11: the scheduled sweep made OVERDUE reachable, and a book in your
+        // hands is returnable whether or not it's late. Before this, going overdue made a loan
+        // permanently unreturnable. The set is the single source of truth for the policy — it
+        // feeds both the check and the error message, so adding a state can't leave the 409
+        // body describing the old rule.
+        if (!RETURNABLE_STATES.contains(loan.getStatus())) {
+            throw new IllegalLoanStateException(loanId, loan.getStatus(),
+                    RETURNABLE_STATES.toArray(LoanStatus[]::new));
         }
         loan.setStatus(LoanStatus.RETURNED);
         loan.setReturnDate(Instant.now());

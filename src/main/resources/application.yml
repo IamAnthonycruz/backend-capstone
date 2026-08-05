@@ -40,6 +40,10 @@ spring:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:}
+      # Bounds how long a cache call blocks before it throws and fail-open kicks in.
+      # timeout = per-command wait; connect-timeout = initial socket connect.
+      timeout: 60ms
+      connect-timeout: 60ms
   cache:
     type: redis
 
@@ -49,6 +53,22 @@ spring:
     port: ${RABBITMQ_PORT:5672}
     username: ${RABBITMQ_USERNAME:readshelf}
     password: ${RABBITMQ_PASSWORD:readshelf}
+    listener:
+      simple:
+        # THE important switch. Spring AMQP's default is `true`, which puts a failed message
+        # straight back on the queue to be redelivered immediately, forever — the poison-message
+        # hot loop. `false` means a rejected message is dead-lettered instead (or dropped, if the
+        # queue has no DLX — which is why RabbitConfig gives every queue one).
+        default-requeue-rejected: false
+        retry:
+          # In-memory retry INSIDE the listener, before the message is ever rejected. This is
+          # what gives transient failures (SMTP blip) a second chance without a broker round
+          # trip. 4 attempts backing off 2s -> 4s -> 8s, so ~14s of grace before dead-lettering.
+          enabled: true
+          max-attempts: 4
+          initial-interval: 2s
+          multiplier: 2
+          max-interval: 30s
 
   # --- Search (Elasticsearch) ---
   elasticsearch:
@@ -71,6 +91,18 @@ spring:
       file: docker-compose.yml
       lifecycle-management: start-only
 
+  # --- Scheduled task execution ---
+  task:
+    scheduling:
+      # Defaults to 1, which SERIALIZES every @Scheduled method onto one thread — a long overdue
+      # sweep would stall the outbox poller for its whole duration. Not a throughput tuning knob:
+      # the value is "how many jobs must not block each other", so RAISE THIS when adding a job.
+      # Currently OutboxPoller.publishPendingEvents + OverdueLoanChecker.flagOverdueLoans
+      # + OutboxCleanupJob.deleteOldProcessedEvents.
+      # Actual pool/queue SIZING under load belongs to Phase 21.
+      pool:
+        size: ${SCHEDULING_POOL_SIZE:3}
+
 server:
   port: ${SERVER_PORT:8080}
   shutdown: graceful
@@ -88,6 +120,21 @@ logging:
 # No Spring auto-configuration exists for MinIO; these keys are bound by a
 # @ConfigurationProperties class added in the object-storage phase.
 readshelf:
+  jobs:
+    # Nightly overdue sweep. Six fields (leading one is SECONDS, unlike Unix cron).
+    # Override to something like "*/20 * * * * *" to exercise it locally.
+    overdue-check-cron: ${OVERDUE_CHECK_CRON:0 0 2 * * *}
+    # Outbox cleanup, an hour after the sweep so the two don't contend for a scheduler thread
+    # (the sweep is the one that writes outbox rows).
+    outbox-cleanup-cron: ${OUTBOX_CLEANUP_CRON:0 0 3 * * *}
+    # How long a PUBLISHED outbox row is kept before deletion. Bound as a java.time.Duration,
+    # so ISO-8601 (PT12H) or Spring's shorthand (7d, 12h) both parse.
+    outbox-retention: ${OUTBOX_RETENTION:7d}
+  mail:
+    # Sender identity for outbound notifications. Environment-specific by nature: dev points at
+    # MailHog and nobody checks the domain, prod must use a domain you actually control or
+    # SPF/DKIM will bounce the mail.
+    from: ${MAIL_FROM:noreply@readshelf.com}
   minio:
     endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
     access-key: ${MINIO_ACCESS_KEY:readshelf}

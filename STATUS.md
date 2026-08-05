@@ -1,6 +1,6 @@
 # ReadShelf — Status
 
-_Last updated: 2026-07-20_
+_Last updated: 2026-07-24_
 
 ## Where we are
 
@@ -61,6 +61,15 @@ holds). Programmatic transaction (`TransactionTemplate`) scoping just the write 
 payload), a `LOAN_REQUESTED` event written in the SAME tx as the loan, and a `@Scheduled`
 `OutboxPoller` that drains + "publishes" (logs; real broker is Phase 11) + stamps
 `processed_at`. All verified live end-to-end. See Phase 9 progress below.
+
+**Phase 10 (Caching): COMPLETE.** Redis-backed Spring Cache. `@Cacheable` on `GET books/{id}`
+and `GET users/{id}/profile` (cache-aside read); `@CacheEvict` on book update/delete and profile
+upsert; loan-approval evict is a documented no-op (availability lives on the uncached `BookCopy`,
+not the cached `books` region). Per-region TTLs (books 10m, userProfiles 30m) + a type-bound JSON
+value serializer per region. **Fail-open**: a `CacheErrorHandler` logs + swallows cache errors so
+a Redis outage degrades to the DB instead of 500ing — bounded by a **60ms Redis command/connect
+timeout** so a dead Redis fails fast (0.19s) instead of blocking ~60s. All verified live
+end-to-end. See Phase 10 progress below.
 
 ## Phase 2 progress
 
@@ -455,6 +464,234 @@ consumers must be idempotent — the same event can re-publish if a publish succ
 fails); a partial `WHERE processed_at IS NULL` index on `outbox` would help once the table grows;
 `FOR UPDATE SKIP LOCKED` on the drain query is the multi-instance-safe upgrade.
 
+## Phase 10 progress
+
+### Done
+- [x] **Cache-aside reads** — `@Cacheable` on `BookService.getById` (region `books`, key `#id`)
+      and `UserProfileService.getByUserId` (region `userProfiles`, key `#userId`). Annotations
+      live on the **service** (a Spring proxy), never the controller, and never on a method the
+      same class self-invokes (self-invocation bypasses the proxy). Verified live: 1st GET = 2 DB
+      queries (miss → DB → populate), 2nd GET = 0 queries (Redis hit); key visible in `redis-cli`.
+- [x] **Evict on write** — `@CacheEvict(key = "#id")` on `BookService.update` + `delete`;
+      `@CacheEvict(value = userProfiles, key = "#userId")` on `UserProfileService.upsert`.
+      **Decision:** evict, not `@CachePut` — CachePut only stays correct while the write's return
+      value is byte-identical to what a read caches; it silently serves divergent data until TTL if
+      that ever drifts, whereas evict self-heals on the next read. Verified: PUT wiped the key, next
+      GET re-queried and returned the new title.
+- [x] **Loan-approval evict = documented no-op** — README asks for an evict on approval (it flips
+      `BookCopy.is_available`), but in **Model A** availability lives on `BookCopy` (uncached) and
+      the cached `books` region (`BookResponseDTO`) carries no availability field. Nothing stale to
+      evict; a comment in `LoanService.approve` says to add one if a cached read ever reflects copy
+      availability.
+- [x] **Per-region TTL + type-bound serialization** (`config.CacheConfig`, `@EnableCaching`).
+      `RedisCacheManagerBuilderCustomizer` sets books=10m, userProfiles=30m (default 10m). **Each
+      region caches exactly one type**, so each uses a `JacksonJsonRedisSerializer` bound to that
+      concrete class (`BookResponseDTO` / `UserProfileResponseDTO`) — reads plain JSON straight back
+      into the record, no `@class` hint. The generic `GenericJacksonJsonRedisSerializer` survives
+      only as the default fallback (default typing on, validator restricted to `com.readshelf.` /
+      `java.util.` / `java.time.`). String keys so they're greppable. **Boot 4 note:**
+      `RedisCacheManagerBuilderCustomizer` moved to `org.springframework.boot.cache.autoconfigure`.
+- [x] **Fail-open** (`config.CacheErrorConfig implements CachingConfigurer`) — overrides the
+      default `SimpleCacheErrorHandler` (which rethrows → 500) with one that logs a warning and
+      swallows GET/PUT/EVICT/CLEAR errors, so a cache op failure falls through to the method body
+      (DB). **Decision:** a caching layer must never block reads *or* writes; evict-failure staleness
+      is bounded by the region TTL. Same philosophy as Phase 8's rate-limiter fail-open.
+- [x] **Bounded timeout is what makes fail-open fast** — the error handler only fires once a cache
+      op *throws*; without a timeout Lettuce **blocks** ~33–60s (its default command timeout) before
+      throwing. Set `spring.data.redis.timeout` + `connect-timeout` = **60ms** so a dead Redis fails
+      fast. Verified live (Redis stopped, staying down): GET returned **200 in 0.19s** (was 33s),
+      `Cache GET failed (serving from DB) … Redis command timed out` warning fired, 2 DB queries
+      served the response. **Tradeoff (known):** 60ms is a *global* command timeout, so under real
+      load/GC a healthy Redis could occasionally exceed it and get treated as down — a prod value
+      typically sits higher (100–250ms); 60ms is tuned for localhost.
+
+### Remaining (Phase 10)
+Nothing — Phase 10 complete. ✅ Carry-overs (non-blocking): a 60ms global command timeout can
+false-positive under load (raise for prod, or use a circuit breaker so a known-down Redis is
+skipped entirely instead of paying the timeout on every request); caching is read-through only on
+two hot GETs — widen if other reads get hot; no cache warming / no metrics on hit-rate yet.
+
+## Phase 11 progress
+
+### Done
+- [x] **AMQP topology** (`config.RabbitConfig`) — ONE topic exchange `readshelf.events`, one durable
+      queue per *logical consumer*. Phase 11 declares only `readshelf.email.queue` (`loan.#`);
+      the search (`book.#`) and webhook (`#`) queues are **deferred to Phases 12 and 16** along with
+      their consumers — see "Deferred queues" below. **Decision:** queue-per-consumer because RabbitMQ
+      round-robins a queue to exactly ONE consumer (competing consumers) — two *different* consumers
+      sharing a queue would split the stream. N instances of the *same* consumer sharing one queue is
+      when that behaviour becomes the feature. No fanout exchange: "everything" is just the topic
+      pattern `#`, and a second exchange would force the poller to publish twice and know the
+      consumer topology. Verified: key `loan.requested` hit email + webhook, correctly missed search.
+- [x] **Routing key stored on the outbox row** (`V15`, `OutboxEvent.routingKey`). **Decision:** store,
+      don't derive from `event_type` at publish time. Deriving couples stored DB values to the wire
+      protocol — a rename silently reroutes to a key no binding matches, and RabbitMQ **discards
+      unroutable messages with no error**. Storing puts the routing decision at the producer, in the
+      same tx as the business write. Same shape as Debezium's outbox event router.
+- [x] **Poller publishes for real** (`OutboxPoller`) — raw bytes + explicit `application/json`
+      content type, NOT via the message converter (the payload is already a JSON string; converting
+      would double-encode it). `PERSISTENT` delivery mode (durable queue keeps the *definition*;
+      persistence keeps the *messages* — you need both). `messageId` = outbox row id, the natural
+      dedup key. Still **at-least-once** by design; the answer is idempotent consumers.
+- [x] **Retry-then-DLQ failure policy** — all three queues carry `x-dead-letter-exchange` →
+      `readshelf.events.dlx` → a **single shared** `readshelf.dlq`. **Decision:** one shared DLQ, not
+      one per consumer — the queue-per-consumer argument rests on competing consumers, and *nothing
+      consumes a DLQ*; it's an inspection bucket, and `x-death` preserves the original queue/routing
+      key. `default-requeue-rejected: false` (Spring's default is `true` = the poison-message hot
+      loop). Retry: 4 attempts, 2s → 4s → 8s.
+- [x] **Permanent vs transient classification** — the test is *does anything change between attempt 1
+      and attempt 4?* Missing loan → `AmqpRejectAndDontRequeueException`; SMTP failure → left to throw
+      into the backoff. **Gotcha (found by testing, not by reading):** that exception does **not**
+      skip retries on its own — the retry interceptor runs first and retries everything; the exception
+      only controls the *destination* (DLX vs requeue). Fixed with a `RabbitListenerRetrySettingsCustomizer`
+      whose predicate classifies permanent failures as non-retryable. Verified: 14.1s → **39ms**.
+      Conversion failures (`MessageConversionException`, and the `IllegalArgumentException` the type
+      mapper throws for an unmapped `__TypeId__`) are classified permanent too: 14s → **8ms**.
+      **Boot 4 note:** `RabbitRetryTemplateCustomizer` → `RabbitListenerRetrySettingsCustomizer`, over
+      Framework 7's new `org.springframework.core.retry` API.
+- [x] **`EmailNotificationConsumer`** — class-level `@RabbitListener` + one `@RabbitHandler` per
+      payload type, plus an `isDefault = true` handler that acks-and-ignores. **Why:** the queue is
+      bound to `loan.#`, so it carries MIXED event types; a single method typed to `LoanRequestedEvent`
+      would have had `loan.overdue` silently coerced into that shape. The poller stamps `__TypeId__`
+      from `event_type` and `RabbitConfig.EVENT_TYPE_MAPPING` + `TypePrecedence.TYPE_ID` resolve it —
+      `trustedPackages` restricted to `com.readshelf.event` (deserializing a header-named class is an
+      RCE shape otherwise). **Add every new event type to that map** or it dead-letters.
+- [x] **Thin events** (`event.LoanRequestedEvent`) — IDs only, no `lenderEmail`. **Decision:** fattening
+      the event with one consumer's needs leaks that consumer into the producer, and freezes a snapshot
+      that goes stale before a replayed/dead-lettered message is retried. Consumers look up current
+      state. (Event-carried state transfer is the legitimate opposite trade at high volume.)
+- [x] **`LoanNotificationView` projection** — replaced `findById`/`JOIN FETCH` in the consumer.
+      `open-in-view: false` + no listener transaction means lazy proxies blow up after the session
+      closes; and `User.userProfile` is `@OneToOne(mappedBy)` which is **EAGER by default and cannot be
+      made lazy without bytecode enhancement**, so loading two users cost 2 extra queries for data
+      nobody read. Projecting two columns: 3 queries → **1**. (Plain `JOIN`, not `JOIN FETCH` —
+      illegal in a constructor expression. Inner join is safe only because both FKs are `NOT NULL`.)
+- [x] **`readshelf.mail.from`** externalized (`${MAIL_FROM:noreply@readshelf.com}`), constructor-injected.
+      Sender is the *app*, not the borrower: forging a `From` you don't own fails SPF/DKIM in prod, and
+      it leaked the borrower's address to the lender before approval.
+
+- [x] **`@Scheduled` overdue sweep** (`loan.OverdueLoanChecker`) — flips past-due `ACTIVE` → `OVERDUE`
+      and writes a `LOAN_OVERDUE` outbox row. **Decision: emit-once, not a nightly reminder.**
+      `loan.overdue` is past tense and means "this loan BECAME overdue" — that happens once. The
+      state machine enforces it for free: the query only selects `ACTIVE`, so a flipped loan can
+      never be picked up again. No dedup table, no `already_notified` column. This is load-bearing
+      for idempotency — if it fired nightly, a consumer could no longer distinguish a duplicate
+      delivery from a legitimate second night, and `messageId` would stop being a usable dedup key.
+      A nightly *nudge*, if ever wanted, is a separate event, not a lie about this one.
+      **Decision: one transaction PER LOAN**, not one around the sweep — a deterministically bad row
+      would otherwise roll back the batch and block every other overdue loan again every night
+      (same shape as dead-lettering one message instead of stalling the queue). Note that the
+      per-loan transaction bounds the *rollback*, not the *loop*: `executeWithoutResult` rethrows, so
+      a `try/catch` inside the loop is what keeps the remaining loans alive. Failure counts +
+      summary log so "500 flagged" and "0 flagged, 500 failed" don't look alike. Cron externalized
+      (`readshelf.jobs.overdue-check-cron`, default `0 0 2 * * *`) so it's testable without editing
+      code. **Verified live:** 7 flagged → 7 events published → email consumer's `isDefault` handler
+      acked and ignored them (correctly NOT dead-lettered); next tick 20s later found nothing.
+- [x] **Remaining producers** — `LOAN_APPROVED` (in `LoanService.approve`, which is already
+      `@Transactional`, so the outbox row simply joins that transaction), plus `BOOK_CREATED` /
+      `BOOK_UPDATED` in `BookService`. `create()`'s payload switched from `Map.of(...)` to the
+      `LoanRequestedEvent` record — with a Map, adding a field to the event leaves the producer
+      untouched and the consumer silently gets null; with the record it's a compile error.
+      **Verified live:** POST /books → 201 → `BOOK_CREATED` row → published as `book.created` →
+      discarded (no binding until Phase 12, as designed). Same for PUT → `BOOK_UPDATED`.
+- [x] **`BookService` transaction boundary is a `TransactionTemplate`, NOT `@Transactional`** —
+      because `update()` also carries `@CacheEvict`. Eviction defaults to `beforeInvocation=false`
+      (fires after the method returns), both are advice on the same proxy call, and Spring does not
+      guarantee their relative order. With `@Transactional`, the evict can run BEFORE the commit; in
+      that window a concurrent `getById` misses, reads the still-uncommitted OLD row, and
+      repopulates the cache — which then stays stale until the region TTL, because the eviction
+      already happened and nothing fires another. Committing inside the body makes the order
+      explicit. `create()` uses the same shape for consistency (it has nothing to evict).
+      **Not proven by test:** the happy path passes under either ordering since it's single
+      threaded; provoking the race needs a concurrent reader (Phase 21).
+- [x] **Scheduler pool size = 2** (`spring.task.scheduling.pool.size`). Spring's default is **1**, so
+      every `@Scheduled` method shares one thread — evidenced live: both `OverdueLoanChecker` and
+      `OutboxPoller` logged from `[scheduling-1]`. A long sweep would stall event publishing for its
+      whole duration (no loss, the outbox is durable, but events stop flowing). **Decision: this is
+      job isolation, not tuning** — the correct value is "how many jobs must not block each other,"
+      which needs no load measurement, which is why it belongs here and not in Phase 21.
+- [x] **`@Async` moved to Phase 21** — it was listed in both phases; Phase 21 already has it next to
+      the Gatling load test that makes pool sizing defensible instead of invented. Phase 11 uses no
+      `@Async` at all, and shouldn't: `@Async` is fire-and-forget on a local pool, so work dies with
+      the JVM — exactly the guarantee gap the outbox + broker was built to close. The broker IS the
+      async mechanism here. RabbitMQ listener concurrency moved to Phase 21 for the same reason
+      (genuine tuning, needs load).
+- [x] **`returnLoan` accepts `OVERDUE`** (Phase 7 carry-over, now urgent because the sweep made
+      `OVERDUE` reachable — all 7 swept loans were briefly unreturnable). `RETURNABLE_STATES`
+      (`EnumSet` of `ACTIVE`, `OVERDUE`) is the single source of truth, feeding both the guard and
+      the error message. `IllegalLoanStateException` widened to varargs → `Set<LoanStatus>` so a 409
+      can say "must be one of [ACTIVE, OVERDUE]" instead of naming one state and misleading the
+      caller; single-state call sites (`approve`, `pickup`) are unchanged and keep identical
+      messages. **Compile-verified only** — the endpoint was not exercised (needs a borrower JWT).
+
+- [x] **Deferred queues — `SearchIndexConsumer` → Phase 12, `WebhookDispatchConsumer` → Phase 16.**
+      The README lists both under Phase 11, but Phase 12 owns the ES index mapping / query side and
+      Phase 16 owns `webhook_subscriptions`, HMAC signing, retry backoff, and delivery records. A
+      consumer that logs instead of delivering isn't the README item, it's a placeholder pretending
+      to be one. **Their QUEUES are deferred too** (removed from `RabbitConfig`, deleted from the
+      broker): a queue with no consumer is a growing pile, and buffering events for a consumer two
+      phases out is storing garbage. Each phase declares its own queue + binding alongside its
+      consumer, and **no producer changes when it does** — the payoff of publishing to an exchange
+      rather than a queue. **Known consequence:** until those queues exist, `book.created` matches no
+      binding and RabbitMQ discards it silently (no error, no dead letter). Acceptable while nothing
+      consumes book events; do not forget it when Phase 12 starts.
+
+- [x] **`@RabbitHandler` for `LoanApprovedEvent` + `LoanOverdueEvent`** — both previously hit the
+      `isDefault` handler and were acked without an email. **Recipient for both is the BORROWER**
+      (loan.requested is the only one that emails the lender), which inverted what the projection
+      needed: `LoanNotificationView` grew from `(lenderEmail, borrowerUsername)` to carry both
+      parties' email AND username, so one query serves both directions instead of two
+      near-identical ones.
+      **Payload vs re-read, decided per field:** the overdue email takes `dueDate` from the
+      **event payload**, not from the DB — deliberately against this phase's own "events carry
+      IDs, consumers re-read" rule. `dueDate` isn't current state here, it's the fact the event
+      *asserts* (the sweep found this loan past due **as of that date**). If the loan were renewed
+      between the sweep and the send — retries, a hand-replayed DLQ message — a re-read would put
+      a **future** date in an email telling someone they're late. Recipient details still come
+      from the projection, because those genuinely are current state.
+      Verified by publishing both types straight to the exchange with `__TypeId__` headers
+      (consumer-side test; the producers were verified end-to-end earlier): MailHog received
+      `To: borrow13064@x.com / Loan Overdue / "Your loan from lender13064 was due on
+      2026-07-01T00:00:00Z"` and the matching Loan Approved, with the DLQ unchanged.
+      *Known wart:* `Instant.toString()` in a user-facing email is ugly; formatting it means
+      picking a timezone to render in, which is a real decision, left open.
+- [x] **`OutboxCleanupJob` — nightly, deletes PUBLISHED rows older than a week.** Nothing else ever
+      deleted from `outbox` (the poller only stamps `processedAt`), so the table grew forever and
+      the poller's "find work" query scanned all of it to find the same few unprocessed rows.
+      **Why keep them at all for a week:** a surviving row answers "did we ever emit an event for
+      this?", which `loans` cannot. Without it, a missing notification is ambiguous between "never
+      written" and "written, sent, cleaned up" — different bugs, different fixes. A week covers
+      "someone noticed and asked."
+      **`processed_at IS NOT NULL` is load-bearing, not a filter for tidiness:** an OLD *unpublished*
+      row is a **stuck event**, not garbage. Deleting it would destroy the only evidence and drop
+      the event permanently, so the query cannot see those rows at all.
+      **Batched** — 500 rows per transaction, one transaction *per batch*, capped at 100 batches
+      per run. A single `DELETE` of the whole backlog holds row locks and accumulates dead tuples
+      for the entire transaction; a single transaction wrapped around the loop would do the same
+      thing and defeat the batching. `LIMIT` lives in a subquery because Postgres has no
+      `DELETE ... LIMIT`; native rather than JPQL for the same reason (and it's a set operation
+      with no entities to load). Cutoff is computed **once**, outside the loop, so it can't drift
+      forward mid-run and make eligibility depend on how long the run took.
+      Verified in two halves: the exact `DELETE` run in psql against a 30-day-old *unprocessed*
+      sentinel → `DELETE 5` (LIMIT respected), processed rows 18→13, **sentinel survived**; then
+      the job itself at `*/20 * * * * *` + `PT1S` retention → `deleted 13 rows`, next tick
+      `nothing published before …`, table at 0.
+- [x] **Scheduler pool size 2 → 3** alongside the cleanup job — same rule as before, the value
+      tracks the number of jobs that must not block each other.
+- [x] **`LoanService.create()` payload is a typed record**, not `Map.of(...)` — a new field on
+      `LoanRequestedEvent` is now a compile error instead of a silently-missing key.
+
+### Remaining (Phase 11)
+Nothing — Phase 11 complete. ✅
+
+**`BookService.delete` publishes nothing → moved to Phase 12.** Same reasoning that deferred the
+search and webhook queues: the only consumer for a `BookDeletedEvent` is index removal, and the
+index doesn't exist until Phase 12. Publishing it now would mean an event with no binding, which
+RabbitMQ discards silently — a producer written against a consumer nobody has built. Phase 12 adds
+the event, the `EVENT_TYPE_MAPPING` entry, and the producer call together. **Known consequence
+until then: a deleted book would linger in the search index** — which is only a real defect once
+there IS an index.
+
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the
   mapper + repo, takes/returns DTOs); Mapper = `@Component` implementing generic
@@ -483,6 +720,14 @@ fails); a partial `WHERE processed_at IS NULL` index on `outbox` would help once
   `com.fasterxml.jackson.databind.ObjectMapper` has no bean and won't autowire. Annotations
   stayed at `com.fasterxml.jackson.annotation.*`. Jackson 3 exceptions are **unchecked**
   (`JacksonException extends RuntimeException`) — no `try/catch` forced on `writeValueAsString`.
+- ⚠️ **`V15` broke the expand/contract rule** — it adds `routing_key`, backfills, AND sets `NOT NULL`
+  in one migration, while an older build that doesn't populate the column was still running. That's
+  a new constraint deployed ahead of the code that satisfies it — exactly what splitting V11/V12 was
+  meant to avoid. Correct sequencing: V15 adds nullable → deploy code → V16 sets `NOT NULL`. Harmless
+  on localhost with one instance; do not copy this shape into a real deployment.
+- Phase 11 consumers are **not idempotent yet**. The outbox is at-least-once, so a duplicate delivery
+  currently sends a duplicate email. `messageId` (the outbox row id) is the dedup key when that's worth
+  addressing — re-indexing a document is naturally safe, sending an email twice is not.
 - Rate limiter (Phase 6): not atomic (3 round-trips) → Lua script later; `getRemoteAddr()`
   is the proxy IP behind a LB → `X-Forwarded-For` later; limits are constants → could be
   `@ConfigurationProperties`. Full structured-JSON logging (`logback-spring.xml`) → Phase 18.
@@ -495,8 +740,9 @@ refresh rotation, `@PreAuthorize`) = Phase 5. Cross-cutting filters + request co
 transitions + their ownership rules + service `@Transactional` = Phase 7. RFC 7807 problem
 details + domain exceptions + global advice + Redis fail-open = Phase 8. DB transactions
 (programmatic `TransactionTemplate` + transactional outbox) + painful migrations
-(expand/contract rename, two-step NOT NULL) = Phase 9. Real broker publish of outbox
-events = Phase 11.
+(expand/contract rename, two-step NOT NULL) = Phase 9. Redis-backed caching (cache-aside
+`@Cacheable`/`@CacheEvict`, per-region TTL, fail-open + bounded timeout) = Phase 10. Real broker
+publish of outbox events = Phase 11.
 
 ## Working agreement
 Learning project. Claude handles scaffolding/config/boilerplate (incl. pure
