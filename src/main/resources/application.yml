@@ -75,6 +75,13 @@ spring:
     uris: ${ELASTICSEARCH_URIS:http://localhost:9200}
     username: ${ELASTICSEARCH_USERNAME:}
     password: ${ELASTICSEARCH_PASSWORD:}
+    # Same lesson as spring.data.redis.timeout in Phase 10: falling back gracefully only works
+    # if the failure ARRIVES quickly. The defaults (1s connect, 30s socket) mean a wedged
+    # Elasticsearch — reachable, but never answering — would hang the request for half a minute
+    # before the catch block could return its friendly empty result. These bound the wait to
+    # roughly two seconds, which is already slow for a search box.
+    connection-timeout: ${ELASTICSEARCH_CONNECT_TIMEOUT:500ms}
+    socket-timeout: ${ELASTICSEARCH_SOCKET_TIMEOUT:2s}
 
   # --- Email (JavaMailSender; MailHog in dev) ---
   mail:

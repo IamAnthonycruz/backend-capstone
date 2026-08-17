@@ -2,6 +2,7 @@ package com.readshelf.book;
 
 import com.readshelf.config.CacheConfig;
 import com.readshelf.event.BookCreatedEvent;
+import com.readshelf.event.BookDeletedEvent;
 import com.readshelf.event.BookUpdatedEvent;
 import com.readshelf.outbox.OutboxEvent;
 import com.readshelf.outbox.OutboxRepository;
@@ -139,11 +140,21 @@ public class BookService {
     }
 
 
+    /**
+     * Same TransactionTemplate-not-@Transactional shape as update(), for the same @CacheEvict
+     * ordering reason, plus one specific to deletion: the delete and its outbox row MUST commit
+     * together. If the row were written outside the transaction and the delete then rolled back,
+     * the indexer would remove a document for a book that still exists — and nothing would ever
+     * put it back, because no further event fires for a book that didn't change.
+     */
     @CacheEvict(value = CacheConfig.BOOKS, key = "#id")
     public void delete(UUID id) {
         if (!bookRepository.existsById(id)) {
             throw new BookNotFoundException(id);
         }
-        bookRepository.deleteById(id);
+        transactionTemplate.executeWithoutResult(status -> {
+            bookRepository.deleteById(id);
+            publishOutbox("BOOK_DELETED", "book.deleted", new BookDeletedEvent(id));
+        });
     }
 }
