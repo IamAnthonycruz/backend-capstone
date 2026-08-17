@@ -692,6 +692,113 @@ the event, the `EVENT_TYPE_MAPPING` entry, and the producer call together. **Kno
 until then: a deleted book would linger in the search index** — which is only a real defect once
 there IS an index.
 
+## Phase 12 progress
+
+### Done
+- [x] **`search.BookDocument` is a separate class from the `Book` entity** — not an annotation pass
+      over the JPA entity. **Decision:** the two are shaped by different questions. The entity answers
+      "what is true about this row, normalized"; the document answers "what do I want back from one
+      search, in one hit." Concretely: `summary` here maps to the `description` column (named for the
+      API contract, not the DB), and `id` is a `String` because Elasticsearch's `_id` always is —
+      `BookDocument.documentId(UUID)` is the single place that knows the conversion.
+- [x] **Reviews denormalized INTO the book document** (`List<String> reviews`), not a second index.
+      **Decision:** Elasticsearch has no joins across indexes, so a separate reviews index means two
+      queries whose relevance scores can't be meaningfully combined. Denormalizing means a phrase that
+      appears only in a review still returns the BOOK, scored in one pass. The cost is staleness, which
+      is what the whole consumer below exists to manage. Not `FieldType.Nested`: `Nested` keeps the
+      sub-fields of array *objects* correlated, and a `List<String>` has no sub-fields — ES already
+      indexes every array element under the same field.
+- [x] **Field types chosen per field, not left to dynamic mapping.** `Text` is analyzed (tokenized,
+      lowercased) so it supports out-of-order and fuzzy matching but can't sort or filter exactly;
+      `Keyword` is one verbatim token, exact-match only, and is what sorting/faceting need. `title` is
+      **both** via `@MultiField` (`title` analyzed + `title.raw` keyword for alphabetical sort).
+      `genre` is Keyword alone because it's a dropdown filter, not something typed into a search box —
+      **which is why it is excluded from the `q` query entirely** (a free-text `q` could only match it
+      by being byte-identical to the whole genre string, and Keyword doesn't support fuzziness).
+- [x] **`readshelf.search.queue` carries TWO bindings — `book.#` AND `review.#`.** **Decision:**
+      rejected the alternative of renaming the event to `book.review.created` so one binding covers it.
+      A consumer's binding pattern must not dictate what a producer calls its event; ReviewService
+      shouldn't rename its events because a search index happens to denormalize them. The coupling
+      belongs in the consumer's own declaration, where it's visible.
+- [x] **Three review events, not one lumped `REVIEW_CHANGED`** (`ReviewCreatedEvent` /
+      `ReviewUpdatedEvent` / `ReviewDeletedEvent`, all `(reviewId, bookId)`). **Decision:** an event
+      names what *happened*, not what a consumer should *do*. The indexer treats all three identically,
+      but that's a fact about the indexer — expressed in the indexer as three `@RabbitHandler` methods
+      calling one `reindex`. Phase 16's webhooks will genuinely need to tell a new review from a
+      deleted one. **`bookId` rides along** in all three, which looks like the "events carry ids,
+      consumers re-read" rule being broken but isn't: the thing that goes *stale* is the BOOK document,
+      so `bookId` is the identity of the affected document, not denormalized content. `REVIEW_DELETED`
+      forces it — by delivery time the review row is gone and the join that would recover `bookId` with
+      it. That's also why `ReviewService.delete` switched from `existsById` to `findById`.
+- [x] **All three review operations publish, including update.** Skipping `update` would leave text
+      edited *out* of a review still searchable forever — a search returning a book for words that
+      exist nowhere, which is worse than missing data because it looks authoritative.
+- [x] **`BookDeletedEvent` + `BookService.delete` publishing it** — the Phase 11 carry-over, now closed.
+      This is the one event whose consumer *cannot* re-read from Postgres, because the row is already
+      gone. `ReviewService` gained the same outbox trio as `BookService` (`TransactionTemplate` +
+      `OutboxRepository` + `ObjectMapper`); `create` keeps its 409 catch **inside** the callback so a
+      duplicate rolls back both the review and the outbox row.
+- [x] **`EVENT_TYPE_MAPPING` switched to `Map.ofEntries`** — `Map.of` caps at 10 key/value pairs and
+      the four new events put it at 9, one short of an unhelpful "no suitable method" compile error.
+- [x] **`SearchIndexConsumer` — six event types, two operations.** Five mean "rebuild this book's
+      document," one (`BOOK_DELETED`) means "drop it." **Idempotency falls out of the shape:** reindex
+      reads current state from Postgres and *replaces* the document by id, so the at-least-once
+      duplicate delivery this project guarantees lands on exactly the same result. Note this is the
+      first consumer that's naturally idempotent — the email consumer still isn't.
+- [x] **A missing book in `reindex` is a RACE, not a failure** — logged and skipped, not thrown.
+      **Decision:** the book was deleted between publish and delivery, and `BOOK_DELETED` is already in
+      the queue behind it. Throwing would burn four retries on a row that is never coming back and then
+      dead-letter, raising an alarm for an index that ends up correct either way.
+- [x] **`BookSearchService` uses `ElasticsearchOperations`, not `BookSearchRepository`** — derived
+      query methods have no syntax for per-field boosts, fuzziness, or highlighting. The repository
+      stays for the by-id save/delete the consumer does.
+- [x] **Boosts encode a ranking decision, not a tuning accident:** `title^3 > author^2 > summary >
+      reviews^0.5`. Reached by working two cases against each other — a review saying "reminds me of
+      Dostoevsky" on a Camus novel *should* be reachable (otherwise indexing reviews is pointless), but
+      must never outrank *Crime and Punishment*. You can't tell "author name" from "vibe phrase" at
+      query time, so the lever is weight, not inclusion. `reviews^0.5` (below 1.0) de-emphasizes.
+- [x] **`fuzziness("AUTO")`** — scales allowed edit distance with term length (0 under 3 chars, 1 under
+      6, 2 beyond). A fixed `2` would make "cat" match "bat", "hat" and "car" equally.
+- [x] **Highlight fields derived from the same list as the query**, stripping the `^boost` suffix —
+      `"title^3"` is query syntax, not a field name, and the highlighter wouldn't recognise it.
+- [x] **Graceful degradation is ASYMMETRIC — and that asymmetry is the whole lesson.** Search swallows
+      the failure (`DataAccessResourceFailureException` → warn + empty `PagedResponse`); `reindex`
+      must **not**. Swallowing in the consumer ACKs the message and *destroys* the event, leaving the
+      document permanently stale with nothing left to repair it. Swallowing in search loses nothing —
+      the books are still in Postgres and the user can retry. Caught the narrow
+      `DataAccessResourceFailureException` rather than `DataAccessException`, so a malformed query
+      (a bug in `buildQuery`) still surfaces as a loud 500 instead of silently returning zero hits.
+- [x] **`spring.elasticsearch.connection-timeout` / `socket-timeout` bounded (500ms / 2s)** — the same
+      trap as `spring.data.redis.timeout` in Phase 10. The `catch` can only run once the client gives
+      up, and the defaults (1s connect / **30s socket**) mean a *wedged* ES — reachable but never
+      answering — would hang the user for half a minute before returning its friendly empty list.
+      Failing open only works if the failure arrives fast.
+- [x] **Verified end-to-end against real containers**, not just compiled: `book.created` → outbox →
+      Rabbit → indexed; `q=dostoevski` → *Crime and Punishment* (score 0.518, highlight on `author`);
+      `q=punishmnt` → same book at 0.767, confirming the title boost is actually applied; ES stopped →
+      search returns **200 + empty in 39ms** with the warning logged; writes still 201; the indexing
+      message retries 4× then dead-letters; ES restarted → search recovers with no app restart.
+
+### Remaining (Phase 12)
+Nothing — Phase 12 complete. ✅
+
+**🔴 Known drift: a dead-lettered index event is preserved but never applied.** Exposed by the
+degradation test rather than reasoned about in advance. A book created while ES was down is in
+Postgres with its `BOOK_CREATED` event sitting in `readshelf.dlq` — and it is **not in the search
+index, and nothing will ever put it there.** Search for it and you get nothing, silently. That is
+correct *behaviour* (the event was preserved rather than destroyed) but preserved ≠ applied. The fix
+is the backstop identified earlier in the phase: a periodic full reindex that rebuilds from Postgres
+and heals drift regardless of cause, and/or a DLQ replay path. Neither exists yet. Nothing consumes
+a DLQ (see Phase 11) — it's still an inspection bucket.
+
+**Search requires authentication.** `SecurityConfig` is `anyRequest().authenticated()`, so
+`/api/v1/search/**` inherits that. Not a decision made this phase — just worth knowing it's not a
+public endpoint.
+
+**Local gotcha (environment, not code):** RabbitMQ's management port 15672 falls inside a Windows
+reserved TCP exclusion range (`15661–15760`), so `docker compose up` fails to bind it. Run with
+`RABBITMQ_UI_PORT=15800`. The AMQP port 5672 is unaffected.
+
 ## Conventions locked this phase
 - **Layering:** Controller = HTTP only; `@Service` = logic + entity↔DTO (owns the
   mapper + repo, takes/returns DTOs); Mapper = `@Component` implementing generic
@@ -725,9 +832,24 @@ there IS an index.
   a new constraint deployed ahead of the code that satisfies it — exactly what splitting V11/V12 was
   meant to avoid. Correct sequencing: V15 adds nullable → deploy code → V16 sets `NOT NULL`. Harmless
   on localhost with one instance; do not copy this shape into a real deployment.
-- Phase 11 consumers are **not idempotent yet**. The outbox is at-least-once, so a duplicate delivery
-  currently sends a duplicate email. `messageId` (the outbox row id) is the dedup key when that's worth
-  addressing — re-indexing a document is naturally safe, sending an email twice is not.
+- `EmailNotificationConsumer` is **not idempotent**. The outbox is at-least-once, so a duplicate
+  delivery currently sends a duplicate email. `messageId` (the outbox row id) is the dedup key when
+  that's worth addressing. Phase 12's `SearchIndexConsumer` *is* idempotent for free — re-indexing
+  replaces the document, sending an email twice is not undoable.
+- ⚠️ **`publishOutbox` is duplicated across three services** (`BookService`, `LoanService`,
+  `ReviewService`), each injecting its own `ObjectMapper` + `OutboxRepository`. **Deferred to Phase 13
+  by decision** rather than refactored mid-phase. The extraction is an `OutboxPublisher` `@Component`
+  that must **join the caller's transaction** — never `REQUIRES_NEW` and never its own
+  `TransactionTemplate`, either of which would commit the event separately from the business write and
+  defeat the entire pattern. Open question for that refactor: whether it asserts an active transaction
+  via `TransactionSynchronizationManager.isActualTransactionActive()`.
+- ⚠️ **Nothing enforces that a producer's `eventType` string exists in `EVENT_TYPE_MAPPING`.** A typo
+  compiles, publishes, and only surfaces as a dead-lettered message at the consumer. `EVENT_TYPE_MAPPING`
+  stays an explicit map on purpose — deriving type ids from class names would invalidate the
+  `event_type` values already stored in the outbox table (same reasoning as V15 storing rather than
+  deriving the routing key), and the map doubles as a deserialization **allowlist**, which is an RCE
+  surface if opened up. The fix is a shared enum/constants for the string, not a derived mapping.
+  Bundled with the `OutboxPublisher` extraction → Phase 13.
 - Rate limiter (Phase 6): not atomic (3 round-trips) → Lua script later; `getRemoteAddr()`
   is the proxy IP behind a LB → `X-Forwarded-For` later; limits are constants → could be
   `@ConfigurationProperties`. Full structured-JSON logging (`logback-spring.xml`) → Phase 18.
@@ -742,7 +864,8 @@ details + domain exceptions + global advice + Redis fail-open = Phase 8. DB tran
 (programmatic `TransactionTemplate` + transactional outbox) + painful migrations
 (expand/contract rename, two-step NOT NULL) = Phase 9. Redis-backed caching (cache-aside
 `@Cacheable`/`@CacheEvict`, per-region TTL, fail-open + bounded timeout) = Phase 10. Real broker
-publish of outbox events = Phase 11.
+publish of outbox events = Phase 11. Full-text search (denormalized ES documents, event-driven
+reindex, fuzzy multi_match + boosts + highlighting, degrade-on-down) = Phase 12.
 
 ## Working agreement
 Learning project. Claude handles scaffolding/config/boilerplate (incl. pure

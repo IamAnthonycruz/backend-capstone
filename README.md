@@ -195,19 +195,30 @@ Difficulty rises with joins, aggregation, and pagination:
 ### Phase 12: Search (Topic 17)
 **Goal:** Full-text search across the catalog.
 
-- [ ] Elasticsearch container in `docker-compose.yml`
-- [ ] Book search index with fields: title, author, summary, genre
-- [ ] Review content indexed and searchable
-- [ ] `GET /api/v1/search/books?q=dostoevsky` with fuzzy matching
-- [ ] Relevance scoring and result highlighting
-- [ ] `SearchIndexConsumer` (moved here from Phase 11) — declares `readshelf.search.queue` bound to
-      `book.#` on the existing `readshelf.events` exchange, and keeps the index in sync. No producer
-      changes needed; the `book.created` / `book.updated` events are already being published.
-- [ ] `BookDeletedEvent` + `BookService.delete` publishing it (moved here from Phase 11) — the one
+- [x] Elasticsearch container in `docker-compose.yml`
+- [x] Book search index with fields: title, author, summary, genre (`search.BookDocument` — a separate
+      class from the `Book` entity, not an annotated entity; `genre` is `Keyword` so it's a filter
+      field, deliberately excluded from the free-text query)
+- [x] Review content indexed and searchable — **denormalized into the book document** rather than a
+      second index, since Elasticsearch has no cross-index joins. Kept in sync by three new review
+      events (`created` / `updated` / `deleted`), all carrying `bookId`.
+- [x] `GET /api/v1/search/books?q=dostoevsky` with fuzzy matching (`multi_match`, `fuzziness: AUTO`)
+- [x] Relevance scoring and result highlighting — field boosts `title^3 > author^2 > summary >
+      reviews^0.5`, highlights returned per field so a hit's *reason* is visible
+- [x] `SearchIndexConsumer` (moved here from Phase 11) — declares `readshelf.search.queue` bound to
+      **both `book.#` and `review.#`** on the existing `readshelf.events` exchange, and keeps the index
+      in sync. Six event types collapse to two operations (rebuild / drop); idempotent by construction,
+      since a reindex re-reads Postgres and replaces the document by id.
+- [x] `BookDeletedEvent` + `BookService.delete` publishing it (moved here from Phase 11) — the one
       producer Phase 11 left out, because removing a document from the index is the only thing that
-      would consume it and that index doesn't exist until this phase. Needs an `EVENT_TYPE_MAPPING`
-      entry too. Until it lands, a deleted book stays searchable.
-- [ ] Graceful degradation: ES down → return empty results + warning, don't crash
+      would consume it and that index doesn't exist until this phase. `EVENT_TYPE_MAPPING` entry added
+      (and the map moved to `Map.ofEntries` — `Map.of` caps at 10 pairs).
+- [x] Graceful degradation: ES down → return empty results + warning, don't crash. **Search swallows;
+      the indexer deliberately does not** — swallowing there would ACK and destroy the event, leaving
+      the index permanently stale. Connect/socket timeouts bounded (500ms / 2s) so the fallback is
+      fast rather than a 30s hang. Verified live by stopping the container.
+  - ⚠️ Known gap: an index event that dead-letters is preserved but never applied — a periodic
+    reindex backstop / DLQ replay doesn't exist yet. See STATUS.md.
 
 ### Phase 13: Object Storage (Topic 25)
 **Goal:** File uploads for book cover images.
@@ -217,6 +228,12 @@ Difficulty rises with joins, aggregation, and pagination:
 - [ ] Presigned URL generation for direct client download
 - [ ] Metadata (filename, content type, size) stored in PostgreSQL
 - [ ] File size and type validation (max 5MB, images only)
+- [ ] **Refactor carried over from Phase 12:** extract the `publishOutbox` method duplicated across
+      `BookService` / `LoanService` / `ReviewService` into an `OutboxPublisher` `@Component`. It must
+      **join the caller's transaction** — `REQUIRES_NEW` or its own `TransactionTemplate` would commit
+      the event separately from the business write and defeat the outbox pattern entirely. Bundle the
+      event-type typo gap with it (a shared enum/constants, so a bad `eventType` string is a compile
+      error rather than a dead-lettered message). See STATUS.md "Temporary / deferred".
 
 ### Phase 14: Real-Time (Topic 26)
 **Goal:** Push notifications over WebSocket.

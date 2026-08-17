@@ -2,7 +2,12 @@ package com.readshelf.review;
 
 import com.readshelf.book.Book;
 import com.readshelf.book.BookRepository;
+import com.readshelf.event.ReviewCreatedEvent;
+import com.readshelf.event.ReviewDeletedEvent;
+import com.readshelf.event.ReviewUpdatedEvent;
 import com.readshelf.loan.LoanRepository;
+import com.readshelf.outbox.OutboxEvent;
+import com.readshelf.outbox.OutboxRepository;
 import com.readshelf.user.User;
 import com.readshelf.user.UserRepository;
 import com.readshelf.utils.PagedResponse;
@@ -12,7 +17,9 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
+import tools.jackson.databind.ObjectMapper;
 
 import java.util.Optional;
 import java.util.UUID;
@@ -30,17 +37,28 @@ public class ReviewService {
     private final BookRepository bookRepository;
     private final LoanRepository loanRepository;
     private final ReviewMapper reviewMapper;
+    // Outbox collaborators, same trio as BookService: template scopes the transaction to the
+    // write, repo persists the event row, mapper serializes the payload.
+    private final TransactionTemplate transactionTemplate;
+    private final OutboxRepository outboxRepository;
+    private final ObjectMapper objectMapper;
 
     public ReviewService(ReviewRepository reviewRepository,
                          UserRepository userRepository,
                          BookRepository bookRepository,
                          LoanRepository loanRepository,
-                         ReviewMapper reviewMapper) {
+                         ReviewMapper reviewMapper,
+                         TransactionTemplate transactionTemplate,
+                         OutboxRepository outboxRepository,
+                         ObjectMapper objectMapper) {
         this.reviewRepository = reviewRepository;
         this.userRepository = userRepository;
         this.bookRepository = bookRepository;
         this.loanRepository = loanRepository;
         this.reviewMapper = reviewMapper;
+        this.transactionTemplate = transactionTemplate;
+        this.outboxRepository = outboxRepository;
+        this.objectMapper = objectMapper;
     }
 
     public PagedResponse<ReviewResponseDTO> findAll(int page, int size, ReviewSortField sortBy) {
@@ -71,11 +89,21 @@ public class ReviewService {
         Review review = reviewMapper.toEntity(request);
         review.setUser(user);
         review.setBook(book);
-        try {
-            reviewRepository.saveAndFlush(review);
-        }catch(DataIntegrityViolationException dataIntegrityViolationException){
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "A review by this user for this book already exists");
-        }
+
+        // Review + outbox row in ONE transaction, same reasoning as BookService: two separate
+        // commits would let a crash between them persist the review while losing the event, and
+        // the book document would then be missing this review's text until something else
+        // happened to that book. The 409 path throws out of the callback, which rolls back BOTH.
+        transactionTemplate.executeWithoutResult(status -> {
+            try {
+                reviewRepository.saveAndFlush(review);
+            } catch (DataIntegrityViolationException dataIntegrityViolationException) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "A review by this user for this book already exists");
+            }
+            publishOutbox("REVIEW_CREATED", "review.created",
+                    new ReviewCreatedEvent(review.getId(), book.getId()));
+        });
+
         return reviewMapper.toResponseDTO(review);
     }
 
@@ -89,16 +117,45 @@ public class ReviewService {
         Review review = existing.get();
         review.setRating(request.rating());
         review.setContent(request.content());
-        reviewRepository.save(review);
+
+        transactionTemplate.executeWithoutResult(status -> {
+            reviewRepository.save(review);
+            publishOutbox("REVIEW_UPDATED", "review.updated",
+                    new ReviewUpdatedEvent(review.getId(), review.getBook().getId()));
+        });
+
         return Optional.of(reviewMapper.toResponseDTO(review));
     }
 
+    /**
+     * Loads the review rather than using existsById, because the event needs the owning book's id
+     * and after the delete there is nowhere left to read it from.
+     */
     public boolean delete(UUID id) {
-        if (!reviewRepository.existsById(id)) {
+        Optional<Review> existing = reviewRepository.findById(id);
+        if (existing.isEmpty()) {
             return false;
         }
-        reviewRepository.deleteById(id);
+        UUID bookId = existing.get().getBook().getId();
+
+        transactionTemplate.executeWithoutResult(status -> {
+            reviewRepository.deleteById(id);
+            publishOutbox("REVIEW_DELETED", "review.deleted", new ReviewDeletedEvent(id, bookId));
+        });
+
         return true;
+    }
+
+    /**
+     * Writes an outbox row. Must be called from inside a transaction that also contains the
+     * business write — on its own it gives you nothing the pattern is for.
+     */
+    private void publishOutbox(String eventType, String routingKey, Object payload) {
+        OutboxEvent outboxEvent = new OutboxEvent();
+        outboxEvent.setEventType(eventType);
+        outboxEvent.setRoutingKey(routingKey);
+        outboxEvent.setPayload(objectMapper.writeValueAsString(payload));
+        outboxRepository.save(outboxEvent);
     }
 
     private User resolveUser(UUID userId) {

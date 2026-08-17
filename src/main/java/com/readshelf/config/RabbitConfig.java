@@ -7,10 +7,14 @@ import org.springframework.amqp.core.Queue;
 import org.springframework.amqp.core.QueueBuilder;
 import org.springframework.amqp.core.TopicExchange;
 import com.readshelf.event.BookCreatedEvent;
+import com.readshelf.event.BookDeletedEvent;
 import com.readshelf.event.BookUpdatedEvent;
 import com.readshelf.event.LoanApprovedEvent;
 import com.readshelf.event.LoanOverdueEvent;
 import com.readshelf.event.LoanRequestedEvent;
+import com.readshelf.event.ReviewCreatedEvent;
+import com.readshelf.event.ReviewDeletedEvent;
+import com.readshelf.event.ReviewUpdatedEvent;
 import org.springframework.amqp.support.converter.DefaultJacksonJavaTypeMapper;
 import org.springframework.amqp.support.converter.JacksonJavaTypeMapper;
 import org.springframework.amqp.support.converter.JacksonJsonMessageConverter;
@@ -39,19 +43,23 @@ import java.util.Map;
  * Routing keys are dotted words (loan.requested, book.created); binding patterns match them
  * word-by-word, where * = exactly one word and # = zero or more words.
  *
- *   poller -> [readshelf.events (topic)] --"loan.#"--> readshelf.email.queue
+ *   poller -> [readshelf.events (topic)] --"loan.#"----> readshelf.email.queue
+ *                                        --"book.#"----> readshelf.search.queue
+ *                                        --"review.#"--/
  *
- * DEFERRED QUEUES: readshelf.search.queue ("book.#") belongs to Phase 12, which owns the
- * Elasticsearch index mapping and query side; readshelf.webhook.queue ("#") belongs to Phase 16,
- * which owns webhook_subscriptions, HMAC signing, and delivery records. Neither queue is declared
- * here, because a queue with no consumer is just a growing pile — buffering events for a consumer
- * two phases away is storing garbage, not planning ahead. Each phase declares its own queue and
- * binding when it declares its consumer, and NO producer changes when it does. That is the whole
- * point of publishing to an exchange instead of to a queue.
+ * Phase 12 added readshelf.search.queue and its two bindings, and NOT ONE PRODUCER CHANGED to
+ * make book events start flowing to it — that is the whole point of publishing to an exchange
+ * instead of to a queue. (New producers were added this phase, but for events that genuinely
+ * did not exist before: book.deleted and review.created.)
  *
- * Consequence to be aware of: until those queues exist, "book.created" matches no binding and
- * RabbitMQ DISCARDS it silently — no error, no dead letter. Fine while nothing needs those events;
- * see the V15 migration comment for why unroutable-means-gone is worth respecting.
+ * DEFERRED QUEUE: readshelf.webhook.queue ("#") belongs to Phase 16, which owns
+ * webhook_subscriptions, HMAC signing, and delivery records. It isn't declared here, because a
+ * queue with no consumer is just a growing pile — buffering events for a consumer four phases
+ * away is storing garbage, not planning ahead.
+ *
+ * Consequence to be aware of: an event matching no binding is DISCARDED silently by RabbitMQ —
+ * no error, no dead letter. See the V15 migration comment for why unroutable-means-gone is
+ * worth respecting.
  *
  * FAILURE PATH: queues dead-letter to a SINGLE shared DLQ. The queue-per-consumer
  * argument above doesn't carry over, because it rests on competing consumers — and nothing
@@ -74,6 +82,7 @@ public class RabbitConfig {
     public static final String EXCHANGE = "readshelf.events";
 
     public static final String EMAIL_QUEUE = "readshelf.email.queue";
+    public static final String SEARCH_QUEUE = "readshelf.search.queue";
 
     // Where a message goes once the listener has given up on it.
     public static final String DLX = "readshelf.events.dlx";
@@ -81,6 +90,8 @@ public class RabbitConfig {
 
     // Binding patterns — the "what do I care about?" declaration for each consumer.
     private static final String LOAN_EVENTS = "loan.#";
+    private static final String BOOK_EVENTS = "book.#";
+    private static final String REVIEW_EVENTS = "review.#";
     private static final String ALL_EVENTS = "#";
 
     @Bean
@@ -104,6 +115,11 @@ public class RabbitConfig {
     // mode, which RabbitTemplate sets by default. You need both to actually keep messages.
 
     @Bean
+    Queue searchQueue() {
+        return QueueBuilder.durable(SEARCH_QUEUE).deadLetterExchange(DLX).build();
+    }
+
+    @Bean
     TopicExchange deadLetterExchange() {
         return new TopicExchange(DLX, true, false);
     }
@@ -122,6 +138,30 @@ public class RabbitConfig {
     @Bean
     Binding emailBinding(Queue emailQueue, TopicExchange eventsExchange) {
         return BindingBuilder.bind(emailQueue).to(eventsExchange).with(LOAN_EVENTS);
+    }
+
+    /**
+     * The search queue gets TWO bindings, and that pair is the point.
+     *
+     * A book document is denormalized: it carries the book's own fields AND the text of every
+     * review of that book. So the document goes stale for two unrelated reasons — the book
+     * changed, or a review of it did — and the indexer has to hear about both.
+     *
+     * The alternative was to name the review event "book.review.created" so one "book.#" binding
+     * caught it. Rejected: that lets a CONSUMER's binding pattern dictate what a PRODUCER calls
+     * its event, which is backwards. A review event is about a review. Phase 11 locked the rule
+     * that producers stay ignorant of who listens, so the coupling belongs here, in the
+     * consumer's own declaration of what it cares about — where a queue having many bindings is
+     * the normal, cheap thing.
+     */
+    @Bean
+    Binding searchBookBinding(Queue searchQueue, TopicExchange eventsExchange) {
+        return BindingBuilder.bind(searchQueue).to(eventsExchange).with(BOOK_EVENTS);
+    }
+
+    @Bean
+    Binding searchReviewBinding(Queue searchQueue, TopicExchange eventsExchange) {
+        return BindingBuilder.bind(searchQueue).to(eventsExchange).with(REVIEW_EVENTS);
     }
 
     /**
@@ -150,15 +190,19 @@ public class RabbitConfig {
      * ADD AN ENTRY HERE for every new event type. An id with no mapping fails to deserialize
      * and ends up in the DLQ.
      */
-    public static final Map<String, Class<?>> EVENT_TYPE_MAPPING = Map.of(
-            "LOAN_REQUESTED", LoanRequestedEvent.class,
-            "LOAN_APPROVED", LoanApprovedEvent.class,
-            "LOAN_OVERDUE", LoanOverdueEvent.class,
-            // Mapped even though no queue is bound to book.# until Phase 12 — the mapping is about
-            // how to DESERIALIZE a type, not about who receives it. Having it ready means Phase 12
-            // adds a queue and a handler, and touches nothing here.
-            "BOOK_CREATED", BookCreatedEvent.class,
-            "BOOK_UPDATED", BookUpdatedEvent.class
+    // Map.ofEntries rather than Map.of: the latter tops out at 10 key/value pairs, and this map
+    // grows by one every time an event type is added. Hitting that ceiling produces a compile
+    // error whose message says nothing about the real cause.
+    public static final Map<String, Class<?>> EVENT_TYPE_MAPPING = Map.ofEntries(
+            Map.entry("LOAN_REQUESTED", LoanRequestedEvent.class),
+            Map.entry("LOAN_APPROVED", LoanApprovedEvent.class),
+            Map.entry("LOAN_OVERDUE", LoanOverdueEvent.class),
+            Map.entry("BOOK_CREATED", BookCreatedEvent.class),
+            Map.entry("BOOK_UPDATED", BookUpdatedEvent.class),
+            Map.entry("BOOK_DELETED", BookDeletedEvent.class),
+            Map.entry("REVIEW_CREATED", ReviewCreatedEvent.class),
+            Map.entry("REVIEW_UPDATED", ReviewUpdatedEvent.class),
+            Map.entry("REVIEW_DELETED", ReviewDeletedEvent.class)
     );
 
     @Bean
